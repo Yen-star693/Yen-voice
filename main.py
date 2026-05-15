@@ -248,9 +248,9 @@ async def join(ctx, *, vc_link=None):
         else:
             return await ctx.send("voice connection failed")
 
-   except Exception as e:
-    print("Join Error:", repr(e))
-    await ctx.send("couldn't join vc")
+    except Exception as e:
+        print("Join Error:", repr(e))
+        await ctx.send("couldn't join vc")
 
 # ================= LEAVE VC =================
 
