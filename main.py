@@ -41,41 +41,25 @@ intents.message_content = True
 intents.guilds = True
 intents.voice_states = True
 
-bot = commands.Bot(
-    command_prefix="yen ",
-    intents=intents
-)
-
-# ================= ACTIVITY TRACKING =================
+bot = commands.Bot(command_prefix="yen ", intents=intents)
 
 last_activity = {}
 
 # ================= AI =================
 
 def ask_ai(prompt):
-
     try:
-
         r = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROQ_KEY}"
-            },
+            headers={"Authorization": f"Bearer {GROQ_KEY}"},
             json={
                 "model": "llama-3.1-8b-instant",
                 "messages": [
                     {
                         "role": "system",
-                        "content": (
-                            "You are Yen. "
-                            "Sarcastic, casual, funny, blunt. "
-                            "Keep responses short and natural."
-                        )
+                        "content": "You are Yen. Sarcastic, casual, funny, blunt. Keep responses short."
                     },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
+                    {"role": "user", "content": prompt}
                 ],
                 "max_tokens": 80
             },
@@ -86,20 +70,16 @@ def ask_ai(prompt):
             print("Groq Error:", r.text)
             return "api exploded"
 
-        data = r.json()
-
-        return data["choices"][0]["message"]["content"]
+        return r.json()["choices"][0]["message"]["content"]
 
     except Exception as e:
         print("AI Error:", e)
         return "my brain exploded"
 
-# ================= PLAY AUDIO =================
+# ================= SPEAK =================
 
 async def speak(vc, text):
-
     try:
-
         output_file = "response.mp3"
 
         if os.path.exists(output_file):
@@ -114,8 +94,6 @@ async def speak(vc, text):
         )
 
         await communicate.save(output_file)
-
-        await asyncio.sleep(1)
 
         if vc.is_playing():
             vc.stop()
@@ -135,256 +113,155 @@ async def speak(vc, text):
 # ================= AUTO DISCONNECT =================
 
 async def auto_disconnect(guild_id):
-
     await asyncio.sleep(IDLE_TIMEOUT)
 
     guild = bot.get_guild(guild_id)
-
     if not guild:
         return
 
-    vc = discord.utils.get(
-        bot.voice_clients,
-        guild=guild
-    )
-
+    vc = guild.voice_client
     if not vc:
         return
 
     last_used = last_activity.get(guild_id, 0)
 
     if time.time() - last_used >= IDLE_TIMEOUT:
-
         try:
             await vc.disconnect()
-            print(f"Disconnected from {guild.name} due to inactivity")
-
+            print(f"Disconnected from {guild.name}")
         except Exception as e:
             print("Disconnect Error:", e)
 
-# ================= JOIN VC =================
+# ================= JOIN =================
 
 @bot.command()
 async def join(ctx, *, vc_link=None):
 
     try:
-
-        # ================= JOIN THROUGH LINK =================
         if vc_link:
-
-            match = re.search(
-                r'/channels/(\d+)/(\d+)',
-                vc_link
-            )
-
+            match = re.search(r'/channels/(\d+)/(\d+)', vc_link)
             if not match:
                 return await ctx.send("invalid vc link")
 
-            guild_id = int(match.group(1))
-            channel_id = int(match.group(2))
+            guild = bot.get_guild(int(match.group(1)))
+            channel = bot.get_channel(int(match.group(2)))
 
-            guild = bot.get_guild(guild_id)
-
-            if not guild:
-                return await ctx.send("guild not found")
-
-            channel = guild.get_channel(channel_id)
-
-            if not channel:
-                return await ctx.send("vc not found")
+            if not guild or not channel:
+                return await ctx.send("not found")
 
             if not isinstance(channel, discord.VoiceChannel):
                 return await ctx.send("not a vc")
 
-        # ================= NORMAL JOIN =================
         else:
-
             if not ctx.author.voice:
                 return await ctx.send("join vc first")
 
             channel = ctx.author.voice.channel
 
-        # ================= CONNECT =================
-
-        vc = discord.utils.get(
-            bot.voice_clients,
-            guild=ctx.guild
-        )
-
-        if vc:
-
-            if vc.channel == channel:
-                return await ctx.send("already there")
-
-            await vc.move_to(channel)
-
-        else:
-
-            vc = await channel.connect(
-                timeout=30
-            )
-
-        # IMPORTANT FOR RENDER
-        await asyncio.sleep(3)
-
-        # VERIFY CONNECTION
-        vc = discord.utils.get(
-            bot.voice_clients,
-            guild=ctx.guild
-        )
+        vc = ctx.guild.voice_client
 
         if vc and vc.is_connected():
-
-            last_activity[ctx.guild.id] = time.time()
-
-            asyncio.create_task(
-                auto_disconnect(ctx.guild.id)
-            )
-
-            await ctx.send(f"joined {channel.name}")
-
-            print(f"Joined VC: {channel.name}")
-
+            if vc.channel == channel:
+                return await ctx.send("already there")
+            await vc.move_to(channel)
         else:
-            return await ctx.send("voice connection failed")
+            vc = await channel.connect()
+
+        last_activity[ctx.guild.id] = time.time()
+        asyncio.create_task(auto_disconnect(ctx.guild.id))
+
+        await ctx.send(f"joined {channel.name}")
+        print("Joined VC:", channel.name)
 
     except Exception as e:
         print("Join Error:", repr(e))
         await ctx.send("couldn't join vc")
 
-# ================= LEAVE VC =================
+# ================= LEAVE =================
 
 @bot.command()
 async def leave(ctx):
-
     try:
-
-        vc = discord.utils.get(
-            bot.voice_clients,
-            guild=ctx.guild
-        )
+        vc = ctx.guild.voice_client
 
         if vc:
-
             if vc.is_playing():
                 vc.stop()
 
             await vc.disconnect()
-
             await ctx.send("bye")
 
     except Exception as e:
         print("Leave Error:", e)
 
-# ================= STOP AUDIO =================
+# ================= STOP =================
 
 @bot.command()
 async def stop(ctx):
-
     try:
-
-        vc = discord.utils.get(
-            bot.voice_clients,
-            guild=ctx.guild
-        )
+        vc = ctx.guild.voice_client
 
         if vc and vc.is_playing():
-
             vc.stop()
-
             await ctx.send("stopped")
 
     except Exception as e:
         print("Stop Error:", e)
 
-# ================= AI SPEAK =================
+# ================= ASK (VOICE) =================
 
 @bot.command()
 async def ask(ctx, *, question):
 
     try:
-
-        vc = discord.utils.get(
-            bot.voice_clients,
-            guild=ctx.guild
-        )
+        vc = ctx.guild.voice_client
 
         if not vc or not vc.is_connected():
             return await ctx.send("im not in vc")
 
-        # only same vc users
-        if (
-            not ctx.author.voice
-            or ctx.author.voice.channel != vc.channel
-        ):
+        if not ctx.author.voice or ctx.author.voice.channel != vc.channel:
             return await ctx.send("you gotta be in my vc")
 
         last_activity[ctx.guild.id] = time.time()
 
-        asyncio.create_task(
-            auto_disconnect(ctx.guild.id)
-        )
-
         response = ask_ai(question)
 
-        # VOICE ONLY
         await speak(vc, response)
 
     except Exception as e:
         print("Ask Error:", e)
         await ctx.send("voice broke")
 
-# ================= AUTO CHAT TRIGGER =================
+# ================= AUTO CHAT =================
 
 @bot.event
 async def on_message(message):
 
     try:
-
         if message.author.bot:
             return
 
         await bot.process_commands(message)
 
-        # ignore commands
-        if message.content.startswith("yen "):
-            return
-
         if not message.guild:
             return
 
-        vc = discord.utils.get(
-            bot.voice_clients,
-            guild=message.guild
-        )
-
+        vc = message.guild.voice_client
         if not vc:
             return
 
-        # user must be in same vc
-        if (
-            not message.author.voice
-            or message.author.voice.channel != vc.channel
-        ):
+        if not message.author.voice or message.author.voice.channel != vc.channel:
             return
 
-        # trigger
         if message.content.lower().startswith("hey yen"):
 
-            question = message.content[8:].strip()
-
+            question = message.content.lower().replace("hey yen", "", 1).strip()
             if not question:
                 return
 
             last_activity[message.guild.id] = time.time()
 
-            asyncio.create_task(
-                auto_disconnect(message.guild.id)
-            )
-
             response = ask_ai(question)
-
-            # VOICE ONLY
             await speak(vc, response)
 
     except Exception as e:
@@ -394,7 +271,6 @@ async def on_message(message):
 
 @bot.event
 async def on_ready():
-
     print(f"Logged in as {bot.user}")
     print("FFmpeg Path:", FFMPEG_PATH)
 
