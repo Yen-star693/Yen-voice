@@ -5,6 +5,26 @@ import asyncio
 import edge_tts
 import os
 import imageio_ffmpeg
+import re
+import time
+
+from flask import Flask
+from threading import Thread
+
+# ================= KEEP ALIVE =================
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Yen Voice Bot Online"
+
+def run_web():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run_web)
+    t.start()
 
 # ================= CONFIG =================
 
@@ -14,13 +34,22 @@ GROQ_KEY = "GROQ_KEY"
 # automatic ffmpeg path for replit/mobile hosting
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 
+# auto leave after inactivity
+IDLE_TIMEOUT = 120
+
 intents = discord.Intents.default()
 intents.message_content = True
+intents.guilds = True
+intents.voice_states = True
 
 bot = commands.Bot(
     command_prefix="yen ",
     intents=intents
 )
+
+# ================= ACTIVITY TRACKING =================
+
+last_activity = {}
 
 # ================= AI =================
 
@@ -65,48 +94,6 @@ def ask_ai(prompt):
         print("AI Error:", e)
         return "my brain exploded"
 
-# ================= JOIN VC =================
-
-@bot.command()
-async def join(ctx):
-
-    if not ctx.author.voice:
-        return await ctx.send("join vc first")
-
-    channel = ctx.author.voice.channel
-
-    if ctx.voice_client:
-
-        if ctx.voice_client.channel == channel:
-            return await ctx.send("already there")
-
-        await ctx.voice_client.move_to(channel)
-
-    else:
-        await channel.connect()
-
-    await ctx.send("joined")
-
-# ================= LEAVE VC =================
-
-@bot.command()
-async def leave(ctx):
-
-    if ctx.voice_client:
-        await ctx.voice_client.disconnect()
-        await ctx.send("bye")
-
-# ================= STOP AUDIO =================
-
-@bot.command()
-async def stop(ctx):
-
-    vc = ctx.voice_client
-
-    if vc and vc.is_playing():
-        vc.stop()
-        await ctx.send("stopped")
-
 # ================= PLAY AUDIO =================
 
 async def speak(vc, text):
@@ -130,6 +117,115 @@ async def speak(vc, text):
         )
     )
 
+# ================= AUTO DISCONNECT =================
+
+async def auto_disconnect(guild_id):
+
+    await asyncio.sleep(IDLE_TIMEOUT)
+
+    guild = bot.get_guild(guild_id)
+
+    if not guild:
+        return
+
+    vc = guild.voice_client
+
+    if not vc:
+        return
+
+    last_used = last_activity.get(guild_id, 0)
+
+    if time.time() - last_used >= IDLE_TIMEOUT:
+
+        try:
+            await vc.disconnect()
+            print(f"Disconnected from {guild.name} due to inactivity")
+        except Exception as e:
+            print("Disconnect Error:", e)
+
+# ================= JOIN VC =================
+
+@bot.command()
+async def join(ctx, *, vc_link=None):
+
+    try:
+
+        # ================= JOIN THROUGH LINK =================
+        if vc_link:
+
+            match = re.search(r'/channels/(\d+)/(\d+)', vc_link)
+
+            if not match:
+                return await ctx.send("invalid vc link")
+
+            guild_id = int(match.group(1))
+            channel_id = int(match.group(2))
+
+            guild = bot.get_guild(guild_id)
+
+            if not guild:
+                return await ctx.send("guild not found")
+
+            channel = guild.get_channel(channel_id)
+
+            if not channel:
+                return await ctx.send("vc not found")
+
+            if not isinstance(channel, discord.VoiceChannel):
+                return await ctx.send("not a vc")
+
+        # ================= NORMAL JOIN =================
+        else:
+
+            if not ctx.author.voice:
+                return await ctx.send("join vc first")
+
+            channel = ctx.author.voice.channel
+
+        # ================= CONNECT =================
+
+        if ctx.voice_client:
+
+            if ctx.voice_client.channel == channel:
+                return await ctx.send("already there")
+
+            await ctx.voice_client.move_to(channel)
+
+        else:
+            await channel.connect()
+
+        last_activity[ctx.guild.id] = time.time()
+
+        asyncio.create_task(
+            auto_disconnect(ctx.guild.id)
+        )
+
+        await ctx.send(f"joined {channel.name}")
+
+    except Exception as e:
+        print("Join Error:", e)
+        await ctx.send("couldn't join vc")
+
+# ================= LEAVE VC =================
+
+@bot.command()
+async def leave(ctx):
+
+    if ctx.voice_client:
+        await ctx.voice_client.disconnect()
+        await ctx.send("bye")
+
+# ================= STOP AUDIO =================
+
+@bot.command()
+async def stop(ctx):
+
+    vc = ctx.voice_client
+
+    if vc and vc.is_playing():
+        vc.stop()
+        await ctx.send("stopped")
+
 # ================= AI SPEAK =================
 
 @bot.command()
@@ -139,6 +235,19 @@ async def ask(ctx, *, question):
 
     if not vc:
         return await ctx.send("im not in vc")
+
+    # only same vc users
+    if (
+        not ctx.author.voice
+        or ctx.author.voice.channel != vc.channel
+    ):
+        return await ctx.send("you gotta be in my vc")
+
+    last_activity[ctx.guild.id] = time.time()
+
+    asyncio.create_task(
+        auto_disconnect(ctx.guild.id)
+    )
 
     if vc.is_playing():
         vc.stop()
@@ -163,10 +272,20 @@ async def on_message(message):
     if message.content.startswith("yen "):
         return
 
+    if not message.guild:
+        return
+
     # only respond if bot is in vc
     vc = message.guild.voice_client
 
     if not vc:
+        return
+
+    # user must be in same vc
+    if (
+        not message.author.voice
+        or message.author.voice.channel != vc.channel
+    ):
         return
 
     # trigger
@@ -176,6 +295,12 @@ async def on_message(message):
 
         if not question:
             return
+
+        last_activity[message.guild.id] = time.time()
+
+        asyncio.create_task(
+            auto_disconnect(message.guild.id)
+        )
 
         if vc.is_playing():
             vc.stop()
@@ -194,4 +319,5 @@ async def on_ready():
 
 # ================= RUN =================
 
+keep_alive()
 bot.run(TOKEN)
