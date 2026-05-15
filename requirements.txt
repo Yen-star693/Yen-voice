@@ -4,3 +4,4 @@ edge-tts
 requests
 ffmpeg
 imageio-ffmpeg
+flask
