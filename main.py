@@ -20,16 +20,17 @@ def home():
     return "Yen Voice Bot Online"
 
 def run_web():
-    app.run(host='0.0.0.0', port=8080)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
-    t = Thread(target=run_web)
+    t = Thread(target=run_web, daemon=True)
     t.start()
 
 # ================= CONFIG =================
 
-TOKEN = "TOKEN"
-GROQ_KEY = "GROQ_KEY"
+TOKEN = os.getenv("TOKEN") or "TOKEN"
+GROQ_KEY = os.getenv("GROQ_KEY") or "GROQ_KEY"
 
 # automatic ffmpeg path for replit/mobile hosting
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
@@ -56,6 +57,7 @@ last_activity = {}
 def ask_ai(prompt):
 
     try:
+
         r = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={
@@ -79,7 +81,7 @@ def ask_ai(prompt):
                 ],
                 "max_tokens": 80
             },
-            timeout=15
+            timeout=20
         )
 
         if r.status_code != 200:
@@ -98,24 +100,42 @@ def ask_ai(prompt):
 
 async def speak(vc, text):
 
-    output_file = "response.mp3"
+    try:
 
-    communicate = edge_tts.Communicate(
-        text=text,
-        voice="en-US-GuyNeural"
-    )
+        output_file = "response.mp3"
 
-    await communicate.save(output_file)
+        # remove old file if exists
+        if os.path.exists(output_file):
+            try:
+                os.remove(output_file)
+            except:
+                pass
 
-    while vc.is_playing():
-        await asyncio.sleep(0.5)
+        communicate = edge_tts.Communicate(
+            text=text,
+            voice="en-US-GuyNeural"
+        )
 
-    vc.play(
-        discord.FFmpegPCMAudio(
+        await communicate.save(output_file)
+
+        # small delay helps replit sometimes
+        await asyncio.sleep(1)
+
+        # stop old playback safely
+        if vc.is_playing():
+            vc.stop()
+
+        source = discord.FFmpegPCMAudio(
             output_file,
             executable=FFMPEG_PATH
         )
-    )
+
+        vc.play(source)
+
+        print("Speaking:", text)
+
+    except Exception as e:
+        print("VOICE ERROR:", e)
 
 # ================= AUTO DISCONNECT =================
 
@@ -140,6 +160,7 @@ async def auto_disconnect(guild_id):
         try:
             await vc.disconnect()
             print(f"Disconnected from {guild.name} due to inactivity")
+
         except Exception as e:
             print("Disconnect Error:", e)
 
@@ -153,7 +174,10 @@ async def join(ctx, *, vc_link=None):
         # ================= JOIN THROUGH LINK =================
         if vc_link:
 
-            match = re.search(r'/channels/(\d+)/(\d+)', vc_link)
+            match = re.search(
+                r'/channels/(\d+)/(\d+)',
+                vc_link
+            )
 
             if not match:
                 return await ctx.send("invalid vc link")
@@ -192,7 +216,10 @@ async def join(ctx, *, vc_link=None):
             await ctx.voice_client.move_to(channel)
 
         else:
-            await channel.connect()
+            await channel.connect(
+                reconnect=True,
+                timeout=30
+            )
 
         last_activity[ctx.guild.id] = time.time()
 
@@ -201,6 +228,8 @@ async def join(ctx, *, vc_link=None):
         )
 
         await ctx.send(f"joined {channel.name}")
+
+        print(f"Joined VC: {channel.name}")
 
     except Exception as e:
         print("Join Error:", e)
@@ -211,111 +240,138 @@ async def join(ctx, *, vc_link=None):
 @bot.command()
 async def leave(ctx):
 
-    if ctx.voice_client:
-        await ctx.voice_client.disconnect()
-        await ctx.send("bye")
+    try:
+
+        if ctx.voice_client:
+
+            if ctx.voice_client.is_playing():
+                ctx.voice_client.stop()
+
+            await ctx.voice_client.disconnect()
+
+            await ctx.send("bye")
+
+    except Exception as e:
+        print("Leave Error:", e)
 
 # ================= STOP AUDIO =================
 
 @bot.command()
 async def stop(ctx):
 
-    vc = ctx.voice_client
+    try:
 
-    if vc and vc.is_playing():
-        vc.stop()
-        await ctx.send("stopped")
+        vc = ctx.voice_client
+
+        if vc and vc.is_playing():
+
+            vc.stop()
+
+            await ctx.send("stopped")
+
+    except Exception as e:
+        print("Stop Error:", e)
 
 # ================= AI SPEAK =================
 
 @bot.command()
 async def ask(ctx, *, question):
 
-    vc = ctx.voice_client
+    try:
 
-    if not vc:
-        return await ctx.send("im not in vc")
+        vc = ctx.voice_client
 
-    # only same vc users
-    if (
-        not ctx.author.voice
-        or ctx.author.voice.channel != vc.channel
-    ):
-        return await ctx.send("you gotta be in my vc")
+        if not vc:
+            return await ctx.send("im not in vc")
 
-    last_activity[ctx.guild.id] = time.time()
+        # only same vc users
+        if (
+            not ctx.author.voice
+            or ctx.author.voice.channel != vc.channel
+        ):
+            return await ctx.send("you gotta be in my vc")
 
-    asyncio.create_task(
-        auto_disconnect(ctx.guild.id)
-    )
+        last_activity[ctx.guild.id] = time.time()
 
-    if vc.is_playing():
-        vc.stop()
+        asyncio.create_task(
+            auto_disconnect(ctx.guild.id)
+        )
 
-    response = ask_ai(question)
+        response = ask_ai(question)
 
-    await ctx.send(response)
+        # text reply
+        await ctx.send(response)
 
-    await speak(vc, response)
+        # voice reply
+        await speak(vc, response)
+
+    except Exception as e:
+        print("Ask Error:", e)
 
 # ================= AUTO CHAT TRIGGER =================
 
 @bot.event
 async def on_message(message):
 
-    if message.author.bot:
-        return
+    try:
 
-    await bot.process_commands(message)
-
-    # ignore commands
-    if message.content.startswith("yen "):
-        return
-
-    if not message.guild:
-        return
-
-    # only respond if bot is in vc
-    vc = message.guild.voice_client
-
-    if not vc:
-        return
-
-    # user must be in same vc
-    if (
-        not message.author.voice
-        or message.author.voice.channel != vc.channel
-    ):
-        return
-
-    # trigger
-    if message.content.lower().startswith("hey yen"):
-
-        question = message.content[8:].strip()
-
-        if not question:
+        if message.author.bot:
             return
 
-        last_activity[message.guild.id] = time.time()
+        await bot.process_commands(message)
 
-        asyncio.create_task(
-            auto_disconnect(message.guild.id)
-        )
+        # ignore commands
+        if message.content.startswith("yen "):
+            return
 
-        if vc.is_playing():
-            vc.stop()
+        if not message.guild:
+            return
 
-        response = ask_ai(question)
+        # only respond if bot is in vc
+        vc = message.guild.voice_client
 
-        await message.reply(response)
+        if not vc:
+            return
 
-        await speak(vc, response)
+        # user must be in same vc
+        if (
+            not message.author.voice
+            or message.author.voice.channel != vc.channel
+        ):
+            return
+
+        # trigger
+        if message.content.lower().startswith("hey yen"):
+
+            question = message.content[8:].strip()
+
+            if not question:
+                return
+
+            last_activity[message.guild.id] = time.time()
+
+            asyncio.create_task(
+                auto_disconnect(message.guild.id)
+            )
+
+            response = ask_ai(question)
+
+            # text reply
+            await message.reply(response)
+
+            # voice reply
+            await speak(vc, response)
+
+    except Exception as e:
+        print("Message Error:", e)
 
 # ================= READY =================
 
 @bot.event
 async def on_ready():
+
     print(f"Logged in as {bot.user}")
+    print("FFmpeg Path:", FFMPEG_PATH)
 
 # ================= RUN =================
 
