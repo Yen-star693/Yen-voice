@@ -4,11 +4,15 @@ import requests
 import asyncio
 import edge_tts
 import os
+import imageio_ffmpeg
 
 # ================= CONFIG =================
 
 TOKEN = "TOKEN"
 GROQ_KEY = "GROQ_KEY"
+
+# automatic ffmpeg path for replit/mobile hosting
+FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -48,6 +52,10 @@ def ask_ai(prompt):
             },
             timeout=15
         )
+
+        if r.status_code != 200:
+            print("Groq Error:", r.text)
+            return "api exploded"
 
         data = r.json()
 
@@ -99,6 +107,29 @@ async def stop(ctx):
         vc.stop()
         await ctx.send("stopped")
 
+# ================= PLAY AUDIO =================
+
+async def speak(vc, text):
+
+    output_file = "response.mp3"
+
+    communicate = edge_tts.Communicate(
+        text=text,
+        voice="en-US-GuyNeural"
+    )
+
+    await communicate.save(output_file)
+
+    while vc.is_playing():
+        await asyncio.sleep(0.5)
+
+    vc.play(
+        discord.FFmpegPCMAudio(
+            output_file,
+            executable=FFMPEG_PATH
+        )
+    )
+
 # ================= AI SPEAK =================
 
 @bot.command()
@@ -109,33 +140,14 @@ async def ask(ctx, *, question):
     if not vc:
         return await ctx.send("im not in vc")
 
-    # prevent overlap
     if vc.is_playing():
         vc.stop()
 
-    # get ai response
     response = ask_ai(question)
 
-    # send text reply
     await ctx.send(response)
 
-    # generate speech
-    communicate = edge_tts.Communicate(
-        text=response,
-        voice="en-US-GuyNeural"
-    )
-
-    output_file = "response.mp3"
-
-    await communicate.save(output_file)
-
-    # play audio
-    vc.play(
-        discord.FFmpegPCMAudio(
-    output_file,
-    executable="ffmpeg"
-)
-    )
+    await speak(vc, response)
 
 # ================= AUTO CHAT TRIGGER =================
 
@@ -157,7 +169,7 @@ async def on_message(message):
     if not vc:
         return
 
-    # trigger if starts with "hey yen"
+    # trigger
     if message.content.lower().startswith("hey yen"):
 
         question = message.content[8:].strip()
@@ -172,18 +184,7 @@ async def on_message(message):
 
         await message.reply(response)
 
-        communicate = edge_tts.Communicate(
-            text=response,
-            voice="en-US-GuyNeural"
-        )
-
-        output_file = "response.mp3"
-
-        await communicate.save(output_file)
-
-        vc.play(
-            discord.FFmpegPCMAudio(output_file)
-        )
+        await speak(vc, response)
 
 # ================= READY =================
 
