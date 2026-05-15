@@ -143,7 +143,10 @@ async def auto_disconnect(guild_id):
     if not guild:
         return
 
-    vc = guild.voice_client
+    vc = discord.utils.get(
+        bot.voice_clients,
+        guild=guild
+    )
 
     if not vc:
         return
@@ -203,7 +206,10 @@ async def join(ctx, *, vc_link=None):
 
         # ================= CONNECT =================
 
-        vc = ctx.guild.voice_client
+        vc = discord.utils.get(
+            bot.voice_clients,
+            guild=ctx.guild
+        )
 
         if vc:
 
@@ -220,23 +226,28 @@ async def join(ctx, *, vc_link=None):
             )
 
         # IMPORTANT FOR RENDER
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
 
         # VERIFY CONNECTION
-        vc = ctx.guild.voice_client
-
-        if not vc:
-            return await ctx.send("voice connection failed")
-
-        last_activity[ctx.guild.id] = time.time()
-
-        asyncio.create_task(
-            auto_disconnect(ctx.guild.id)
+        vc = discord.utils.get(
+            bot.voice_clients,
+            guild=ctx.guild
         )
 
-        await ctx.send(f"joined {channel.name}")
+        if vc and vc.is_connected():
 
-        print(f"Joined VC: {channel.name}")
+            last_activity[ctx.guild.id] = time.time()
+
+            asyncio.create_task(
+                auto_disconnect(ctx.guild.id)
+            )
+
+            await ctx.send(f"joined {channel.name}")
+
+            print(f"Joined VC: {channel.name}")
+
+        else:
+            return await ctx.send("voice connection failed")
 
     except Exception as e:
         print("Join Error:", e)
@@ -249,7 +260,10 @@ async def leave(ctx):
 
     try:
 
-        vc = ctx.guild.voice_client
+        vc = discord.utils.get(
+            bot.voice_clients,
+            guild=ctx.guild
+        )
 
         if vc:
 
@@ -270,7 +284,10 @@ async def stop(ctx):
 
     try:
 
-        vc = ctx.guild.voice_client
+        vc = discord.utils.get(
+            bot.voice_clients,
+            guild=ctx.guild
+        )
 
         if vc and vc.is_playing():
 
@@ -288,9 +305,12 @@ async def ask(ctx, *, question):
 
     try:
 
-        vc = ctx.guild.voice_client
+        vc = discord.utils.get(
+            bot.voice_clients,
+            guild=ctx.guild
+        )
 
-        if not vc:
+        if not vc or not vc.is_connected():
             return await ctx.send("im not in vc")
 
         # only same vc users
@@ -313,6 +333,7 @@ async def ask(ctx, *, question):
 
     except Exception as e:
         print("Ask Error:", e)
+        await ctx.send("voice broke")
 
 # ================= AUTO CHAT TRIGGER =================
 
@@ -333,7 +354,10 @@ async def on_message(message):
         if not message.guild:
             return
 
-        vc = message.guild.voice_client
+        vc = discord.utils.get(
+            bot.voice_clients,
+            guild=message.guild
+        )
 
         if not vc:
             return
