@@ -131,7 +131,10 @@ async def ask(ctx, *, question):
 
     # play audio
     vc.play(
-        discord.FFmpegPCMAudio(output_file)
+        discord.FFmpegPCMAudio(
+    output_file,
+    executable="ffmpeg"
+)
     )
 
 # ================= AUTO CHAT TRIGGER =================
