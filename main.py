@@ -32,10 +32,8 @@ def keep_alive():
 TOKEN = os.getenv("TOKEN") or "TOKEN"
 GROQ_KEY = os.getenv("GROQ_KEY") or "GROQ_KEY"
 
-# automatic ffmpeg path for replit/mobile hosting
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 
-# auto leave after inactivity
 IDLE_TIMEOUT = 120
 
 intents = discord.Intents.default()
@@ -104,7 +102,6 @@ async def speak(vc, text):
 
         output_file = "response.mp3"
 
-        # remove old file if exists
         if os.path.exists(output_file):
             try:
                 os.remove(output_file)
@@ -118,10 +115,8 @@ async def speak(vc, text):
 
         await communicate.save(output_file)
 
-        # small delay helps replit sometimes
         await asyncio.sleep(1)
 
-        # stop old playback safely
         if vc.is_playing():
             vc.stop()
 
@@ -208,18 +203,30 @@ async def join(ctx, *, vc_link=None):
 
         # ================= CONNECT =================
 
-        if ctx.voice_client:
+        vc = ctx.guild.voice_client
 
-            if ctx.voice_client.channel == channel:
+        if vc:
+
+            if vc.channel == channel:
                 return await ctx.send("already there")
 
-            await ctx.voice_client.move_to(channel)
+            await vc.move_to(channel)
 
         else:
-            await channel.connect(
+
+            vc = await channel.connect(
                 reconnect=True,
                 timeout=30
             )
+
+        # IMPORTANT FOR RENDER
+        await asyncio.sleep(2)
+
+        # VERIFY CONNECTION
+        vc = ctx.guild.voice_client
+
+        if not vc:
+            return await ctx.send("voice connection failed")
 
         last_activity[ctx.guild.id] = time.time()
 
@@ -242,12 +249,14 @@ async def leave(ctx):
 
     try:
 
-        if ctx.voice_client:
+        vc = ctx.guild.voice_client
 
-            if ctx.voice_client.is_playing():
-                ctx.voice_client.stop()
+        if vc:
 
-            await ctx.voice_client.disconnect()
+            if vc.is_playing():
+                vc.stop()
+
+            await vc.disconnect()
 
             await ctx.send("bye")
 
@@ -261,7 +270,7 @@ async def stop(ctx):
 
     try:
 
-        vc = ctx.voice_client
+        vc = ctx.guild.voice_client
 
         if vc and vc.is_playing():
 
@@ -279,7 +288,7 @@ async def ask(ctx, *, question):
 
     try:
 
-        vc = ctx.voice_client
+        vc = ctx.guild.voice_client
 
         if not vc:
             return await ctx.send("im not in vc")
@@ -299,10 +308,7 @@ async def ask(ctx, *, question):
 
         response = ask_ai(question)
 
-        # text reply
-        await ctx.send(response)
-
-        # voice reply
+        # VOICE ONLY
         await speak(vc, response)
 
     except Exception as e:
@@ -327,7 +333,6 @@ async def on_message(message):
         if not message.guild:
             return
 
-        # only respond if bot is in vc
         vc = message.guild.voice_client
 
         if not vc:
@@ -356,10 +361,7 @@ async def on_message(message):
 
             response = ask_ai(question)
 
-            # text reply
-            await message.reply(response)
-
-            # voice reply
+            # VOICE ONLY
             await speak(vc, response)
 
     except Exception as e:
