@@ -44,36 +44,43 @@ intents.voice_states = True
 bot = commands.Bot(command_prefix="yen ", intents=intents)
 
 last_activity = {}
+conversation_history = {}
 
 # ================= AI =================
 
-def ask_ai(prompt):
+def ask_ai(guild_id, prompt):
     try:
+        history = conversation_history.get(guild_id, [])
+
+        messages = [
+            {"role": "system", "content": "You are Yen. Sarcastic, casual, funny, blunt. Keep responses short."}
+        ] + history + [{"role": "user", "content": prompt}]
+
         r = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROQ_KEY}"},
             json={
                 "model": "llama-3.1-8b-instant",
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "You are Yen. Sarcastic, casual, funny, blunt. Keep responses short."
-                    },
-                    {"role": "user", "content": prompt}
-                ],
+                "messages": messages,
                 "max_tokens": 80
             },
             timeout=20
         )
 
         if r.status_code != 200:
-            print("Groq Error:", r.text)
+            print("Groq Error:", r.text, flush=True)
             return "api exploded"
 
-        return r.json()["choices"][0]["message"]["content"]
+        reply = r.json()["choices"][0]["message"]["content"]
+
+        history.append({"role": "user", "content": prompt})
+        history.append({"role": "assistant", "content": reply})
+        conversation_history[guild_id] = history[-6:]
+
+        return reply
 
     except Exception as e:
-        print("AI Error:", e)
+        print("AI Error:", e, flush=True)
         return "my brain exploded"
 
 # ================= SPEAK =================
@@ -224,7 +231,7 @@ async def ask(ctx, *, question):
 
         last_activity[ctx.guild.id] = time.time()
 
-        response = ask_ai(question)
+        response = ask_ai(ctx.guild.id, question)
 
         await speak(vc, response)
 
@@ -261,7 +268,7 @@ async def on_message(message):
 
             last_activity[message.guild.id] = time.time()
 
-            response = ask_ai(question)
+            response = ask_ai(message.guild.id, question)
             await speak(vc, response)
 
     except Exception as e:
