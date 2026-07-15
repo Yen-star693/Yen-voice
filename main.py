@@ -253,9 +253,9 @@ async def on_message(message):
         if not message.author.voice or message.author.voice.channel != vc.channel:
             return
 
-        if message.content.lower().startswith("hey yen"):
+        if message.content.lower().startswith("yo yen"):
 
-            question = message.content.lower().replace("hey yen", "", 1).strip()
+            question = message.content.lower().replace("yo yen", "", 1).strip()
             if not question:
                 return
 
