@@ -300,6 +300,27 @@ async def on_message(message):
     except Exception as e:
         print("Message Error:", e)
 
+# ================COMMANDS =================
+@bot.command()
+async def respond(ctx, *, text):
+
+    try:
+        vc = ctx.guild.voice_client
+
+        if not vc or not vc.is_connected():
+            return await ctx.send("im not in vc")
+
+        if not ctx.author.voice or ctx.author.voice.channel != vc.channel:
+            return await ctx.send("you gotta be in my vc")
+
+        last_activity[ctx.guild.id] = time.time()
+
+        await speak(vc, text)
+
+    except Exception as e:
+        print("Respond Error:", e)
+        await ctx.send("voice broke")
+
 # ================= READY =================
 
 @bot.event
