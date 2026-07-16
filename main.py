@@ -7,6 +7,7 @@ import os
 import imageio_ffmpeg
 import re
 import time
+import yt_dlp
 
 from flask import Flask
 from threading import Thread
@@ -320,6 +321,62 @@ async def respond(ctx, *, text):
     except Exception as e:
         print("Respond Error:", e)
         await ctx.send("voice broke")
+
+@bot.command()
+async def play(ctx, url):
+
+    try:
+
+        if not ctx.author.voice:
+            return await ctx.send("join vc first")
+
+        channel = ctx.author.voice.channel
+
+        vc = ctx.guild.voice_client
+
+        if not vc:
+            vc = await channel.connect()
+
+        elif vc.channel != channel:
+            await vc.move_to(channel)
+
+        if vc.is_playing():
+            vc.stop()
+
+        await ctx.send("loading song...")
+
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "quiet": True,
+            "noplaylist": True
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+
+            info = ydl.extract_info(
+                url,
+                download=False
+            )
+
+            if "entries" in info:
+                info = info["entries"][0]
+
+            audio_url = info["url"]
+            title = info["title"]
+
+        source = discord.FFmpegPCMAudio(
+            audio_url,
+            executable=FFMPEG_PATH
+        )
+
+        vc.play(source)
+
+        await ctx.send(f"playing: {title}")
+
+    except Exception as e:
+        print("Play Error:", e, flush=True)
+        await ctx.send("song broke")
+
 
 # ================= READY =================
 
