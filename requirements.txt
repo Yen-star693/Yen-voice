@@ -6,3 +6,4 @@ imageio-ffmpeg
 flask
 gunicorn
 davey
+yt-dlp
