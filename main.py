@@ -378,6 +378,7 @@ async def play(ctx, url):
 
 print("PLAY COMMAND FAILED", flush=True)
 traceback.print_exc()
+
         await ctx.send("song broke")
 
 
