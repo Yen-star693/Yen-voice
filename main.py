@@ -323,7 +323,7 @@ async def respond(ctx, *, text):
         await ctx.send("voice broke")
 
 @bot.command()
-async def play(ctx, url):
+async def play(ctx, *, query):
 
     try:
 
@@ -346,20 +346,17 @@ async def play(ctx, url):
         await ctx.send("loading song...")
 
         ydl_opts = {
-    "format": "bestaudio/best",
-    "quiet": True,
-    "noplaylist": True,
-    "extractor_args": {
-        "youtube": {
-            "player_client": ["android"]
+            "format": "bestaudio/best",
+            "quiet": True,
+            "noplaylist": True,
         }
-    }
-}
+
+        search_query = query if query.startswith("http") else f"scsearch1:{query}"
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
 
             info = ydl.extract_info(
-                url,
+                search_query,
                 download=False
             )
 
@@ -384,7 +381,7 @@ async def play(ctx, url):
         print("PLAY COMMAND FAILED", flush=True)
         traceback.print_exc()
 
-    await ctx.send("song broke")
+        await ctx.send("song broke")
 
 
 # ================= READY =================
