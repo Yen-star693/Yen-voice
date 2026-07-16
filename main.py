@@ -345,11 +345,19 @@ async def play(ctx, *, query):
 
         await ctx.send("loading song...")
 
+        for f in os.listdir("."):
+            if f.startswith("song."):
+                try:
+                    os.remove(f)
+                except:
+                    pass
+
         ydl_opts = {
             "format": "bestaudio/best",
             "quiet": True,
             "noplaylist": True,
             "outtmpl": "song.%(ext)s",
+            "overwrites": True,
         }
 
         search_query = query if query.startswith("http") else f"scsearch1:{query}"
