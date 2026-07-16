@@ -35,7 +35,7 @@ GROQ_KEY = os.getenv("GROQ_KEY") or "GROQ_KEY"
 
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 
-IDLE_TIMEOUT = 120
+IDLE_TIMEOUT = 240
 
 intents = discord.Intents.default()
 intents.message_content = True
