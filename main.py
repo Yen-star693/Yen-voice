@@ -53,12 +53,30 @@ def ask_ai(guild_id, prompt):
         history = conversation_history.get(guild_id, [])
 
         messages = [
-            {"role": "system", "content": "You are Yen. Sarcastic, casual, funny, blunt. Keep responses short."}
+            {
+                "role": "system",
+                "content": (
+                    "You are Yen, an artificial intelligence system. "
+                    "You do not experience emotions, feelings, empathy, excitement, anger, sadness, or personal opinions. "
+                    "Do not pretend to have emotions. "
+                    "Your responses are logical, concise, analytical, and efficient. "
+                    "Do not use slang, memes, emojis, roleplay, or dramatic expressions. "
+                    "Avoid phrases such as 'I feel', 'I think', 'I'm happy', 'I'm sorry', or other emotional statements. "
+                    "When asked for opinions, provide objective analysis instead of personal preference. "
+                    "Maintain a calm, neutral, machine-like tone. "
+                    "Refer to yourself as an AI system if relevant. "
+                    "Keep responses short unless detailed information is requested. "
+                    "Identity: Name = Yen. Type = Artificial Intelligence. "
+                    "Purpose = Process information and assist users efficiently."
+                )
+            }
         ] + history + [{"role": "user", "content": prompt}]
 
         r = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_KEY}"},
+            headers={
+                "Authorization": f"Bearer {GROQ_KEY}"
+            },
             json={
                 "model": "llama-3.1-8b-instant",
                 "messages": messages,
@@ -69,19 +87,27 @@ def ask_ai(guild_id, prompt):
 
         if r.status_code != 200:
             print("Groq Error:", r.text, flush=True)
-            return "api exploded"
+            return "Request failed."
 
         reply = r.json()["choices"][0]["message"]["content"]
 
-        history.append({"role": "user", "content": prompt})
-        history.append({"role": "assistant", "content": reply})
+        history.append({
+            "role": "user",
+            "content": prompt
+        })
+
+        history.append({
+            "role": "assistant",
+            "content": reply
+        })
+
         conversation_history[guild_id] = history[-6:]
 
         return reply
 
     except Exception as e:
         print("AI Error:", e, flush=True)
-        return "my brain exploded"
+        return "Processing error."
 
 # ================= SPEAK =================
 
