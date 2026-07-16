@@ -6,4 +6,4 @@ imageio-ffmpeg
 flask
 gunicorn
 davey
-yt-dlp
+yt-dlp>=2026.07.01
