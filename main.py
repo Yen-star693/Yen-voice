@@ -346,26 +346,26 @@ async def play(ctx, *, query):
         await ctx.send("loading song...")
 
         ydl_opts = {
-    "format": "bestaudio/best",
-    "quiet": True,
-    "noplaylist": True,
-    "outtmpl": "song.%(ext)s",
-}
+            "format": "bestaudio/best",
+            "quiet": True,
+            "noplaylist": True,
+            "outtmpl": "song.%(ext)s",
+        }
 
-search_query = query if query.startswith("http") else f"scsearch1:{query}"
+        search_query = query if query.startswith("http") else f"scsearch1:{query}"
 
-with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
 
-    info = ydl.extract_info(
-        search_query,
-        download=True
-    )
+            info = ydl.extract_info(
+                search_query,
+                download=True
+            )
 
-    if "entries" in info:
-        info = info["entries"][0]
+            if "entries" in info:
+                info = info["entries"][0]
 
-    filename = ydl.prepare_filename(info)
-    title = info["title"]
+            filename = ydl.prepare_filename(info)
+            title = info["title"]
 
         source = discord.FFmpegPCMAudio(
             filename,
