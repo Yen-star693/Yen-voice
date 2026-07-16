@@ -346,10 +346,15 @@ async def play(ctx, url):
         await ctx.send("loading song...")
 
         ydl_opts = {
-            "format": "bestaudio/best",
-            "quiet": True,
-            "noplaylist": True
+    "format": "bestaudio/best",
+    "quiet": True,
+    "noplaylist": True,
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android"]
         }
+    }
+}
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
 
