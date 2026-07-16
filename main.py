@@ -374,7 +374,10 @@ async def play(ctx, url):
         await ctx.send(f"playing: {title}")
 
     except Exception as e:
-        print("Play Error:", e, flush=True)
+        import traceback
+
+print("PLAY COMMAND FAILED", flush=True)
+traceback.print_exc()
         await ctx.send("song broke")
 
 
