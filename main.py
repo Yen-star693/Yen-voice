@@ -9,7 +9,7 @@ import re
 import time
 import yt_dlp
 
-from flask import Flask
+from flask import Flask, request, jsonify
 from threading import Thread
 
 # ================= KEEP ALIVE =================
@@ -19,6 +19,56 @@ app = Flask('')
 @app.route('/')
 def home():
     return "Yen Voice Bot Online"
+
+# ================= TTS HTTP ENDPOINT =================
+# Add API_SECRET as an environment variable on Render.
+# The Android app sends this as the X-Api-Key header.
+
+API_SECRET = os.getenv("API_SECRET", "")
+
+@app.route('/tts', methods=['POST'])
+def tts_endpoint():
+    provided_key = request.headers.get('X-Api-Key', '')
+    if not API_SECRET or provided_key != API_SECRET:
+        return jsonify({'error': 'unauthorized'}), 401
+
+    data = request.get_json(silent=True) or {}
+    text = data.get('text', '').strip()
+
+    if not text:
+        return jsonify({'error': 'no text provided'}), 400
+
+    target_vc = None
+    guild_id_param = data.get('guild_id')
+
+    if guild_id_param:
+        guild = bot.get_guild(int(guild_id_param))
+        if guild:
+            target_vc = guild.voice_client
+    else:
+        for vc in bot.voice_clients:
+            if vc.is_connected():
+                target_vc = vc
+                break
+
+    if not target_vc or not target_vc.is_connected():
+        return jsonify({'error': 'bot not in any voice channel'}), 404
+
+    try:
+        last_activity[target_vc.guild.id] = time.time()
+
+        future = asyncio.run_coroutine_threadsafe(
+            speak(target_vc, text),
+            bot.loop
+        )
+        future.result(timeout=15)
+        return jsonify({'ok': True, 'text': text})
+
+    except Exception as e:
+        print("TTS Endpoint Error:", e, flush=True)
+        return jsonify({'error': str(e)}), 500
+
+# ================= END TTS ENDPOINT =================
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
@@ -92,16 +142,8 @@ def ask_ai(guild_id, prompt):
 
         reply = r.json()["choices"][0]["message"]["content"]
 
-        history.append({
-            "role": "user",
-            "content": prompt
-        })
-
-        history.append({
-            "role": "assistant",
-            "content": reply
-        })
-
+        history.append({"role": "user", "content": prompt})
+        history.append({"role": "assistant", "content": reply})
         conversation_history[guild_id] = history[-6:]
 
         return reply
@@ -170,7 +212,6 @@ async def auto_disconnect(guild_id):
 
 @bot.command()
 async def join(ctx, *, vc_link=None):
-
     try:
         if vc_link:
             match = re.search(r'/channels/(\d+)/(\d+)', vc_link)
@@ -217,14 +258,11 @@ async def join(ctx, *, vc_link=None):
 async def leave(ctx):
     try:
         vc = ctx.guild.voice_client
-
         if vc:
             if vc.is_playing():
                 vc.stop()
-
             await vc.disconnect()
             await ctx.send("bye")
-
     except Exception as e:
         print("Leave Error:", e)
 
@@ -234,11 +272,9 @@ async def leave(ctx):
 async def stop(ctx):
     try:
         vc = ctx.guild.voice_client
-
         if vc and vc.is_playing():
             vc.stop()
             await ctx.send("stopped")
-
     except Exception as e:
         print("Stop Error:", e)
 
@@ -246,7 +282,6 @@ async def stop(ctx):
 
 @bot.command()
 async def ask(ctx, *, question):
-
     try:
         vc = ctx.guild.voice_client
 
@@ -257,9 +292,7 @@ async def ask(ctx, *, question):
             return await ctx.send("you gotta be in my vc")
 
         last_activity[ctx.guild.id] = time.time()
-
         response = ask_ai(ctx.guild.id, question)
-
         await speak(vc, response)
 
     except Exception as e:
@@ -270,7 +303,6 @@ async def ask(ctx, *, question):
 
 @bot.event
 async def on_message(message):
-
     try:
         if message.author.bot:
             return
@@ -288,23 +320,21 @@ async def on_message(message):
             return
 
         if message.content.lower().startswith("yo yen"):
-
             question = message.content.lower().replace("yo yen", "", 1).strip()
             if not question:
                 return
 
             last_activity[message.guild.id] = time.time()
-
             response = ask_ai(message.guild.id, question)
             await speak(vc, response)
 
     except Exception as e:
         print("Message Error:", e)
 
-# ================COMMANDS =================
+# ================= RESPOND =================
+
 @bot.command()
 async def respond(ctx, *, text):
-
     try:
         vc = ctx.guild.voice_client
 
@@ -315,28 +345,25 @@ async def respond(ctx, *, text):
             return await ctx.send("you gotta be in my vc")
 
         last_activity[ctx.guild.id] = time.time()
-
         await speak(vc, text)
 
     except Exception as e:
         print("Respond Error:", e)
         await ctx.send("voice broke")
 
+# ================= PLAY =================
+
 @bot.command()
 async def play(ctx, *, query):
-
     try:
-
         if not ctx.author.voice:
             return await ctx.send("join vc first")
 
         channel = ctx.author.voice.channel
-
         vc = ctx.guild.voice_client
 
         if not vc:
             vc = await channel.connect()
-
         elif vc.channel != channel:
             await vc.move_to(channel)
 
@@ -363,35 +390,21 @@ async def play(ctx, *, query):
         search_query = query if query.startswith("http") else f"scsearch1:{query}"
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-
-            info = ydl.extract_info(
-                search_query,
-                download=True
-            )
-
+            info = ydl.extract_info(search_query, download=True)
             if "entries" in info:
                 info = info["entries"][0]
-
             filename = ydl.prepare_filename(info)
             title = info["title"]
 
-        source = discord.FFmpegPCMAudio(
-            filename,
-            executable=FFMPEG_PATH
-        )
-
+        source = discord.FFmpegPCMAudio(filename, executable=FFMPEG_PATH)
         vc.play(source)
-
         await ctx.send(f"playing: {title}")
 
     except Exception:
         import traceback
-
         print("PLAY COMMAND FAILED", flush=True)
         traceback.print_exc()
-
         await ctx.send("song broke")
-
 
 # ================= READY =================
 
