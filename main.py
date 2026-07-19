@@ -8,6 +8,8 @@ import imageio_ffmpeg
 import re
 import time
 import yt_dlp
+import random
+import string
 
 from flask import Flask, request, jsonify
 from threading import Thread
@@ -418,6 +420,26 @@ async def play(ctx, *, query):
         print("PLAY COMMAND FAILED", flush=True)
         traceback.print_exc()
         await ctx.send("song broke")
+
+@bot.command()
+async def chaos(ctx):
+    try:
+        if not ctx.author.voice:
+            return await ctx.send("join vc first")
+
+        query = ''.join(
+            random.choice(string.ascii_lowercase)
+            for _ in range(3)
+        )
+
+        await ctx.send(f"chaos search: {query}")
+
+        await play(ctx, query=query)
+
+    except Exception as e:
+        print("Chaos Error:", e)
+        await ctx.send("chaos broke")
+
 
 # ================= COMMAND ERROR LOGGING =================
 
