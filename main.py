@@ -21,13 +21,17 @@ def home():
     return "Yen Voice Bot Online"
 
 # ================= TTS HTTP ENDPOINT =================
+# Add API_SECRET as an environment variable on Render.
+# The Android app sends this as the X-Api-Key header.
 
 API_SECRET = os.getenv("API_SECRET", "")
 
 @app.route('/tts', methods=['POST'])
 def tts_endpoint():
+    # Verify secret
     provided_key = request.headers.get('X-Api-Key', '')
     if not API_SECRET or provided_key != API_SECRET:
+        print("TTS: unauthorized request", flush=True)
         return jsonify({'error': 'unauthorized'}), 401
 
     data = request.get_json(silent=True) or {}
@@ -36,6 +40,9 @@ def tts_endpoint():
     if not text:
         return jsonify({'error': 'no text provided'}), 400
 
+    print(f"TTS request: {text[:100]}", flush=True)
+
+    # Find active voice client (optional: pass guild_id in request body to target a specific server)
     target_vc = None
     guild_id_param = data.get('guild_id')
 
@@ -50,20 +57,26 @@ def tts_endpoint():
                 break
 
     if not target_vc or not target_vc.is_connected():
+        print("TTS: bot not connected to a voice channel", flush=True)
         return jsonify({'error': 'bot not in any voice channel'}), 404
 
     try:
+        # Update idle timer so bot doesn't auto-disconnect mid-speech
         last_activity[target_vc.guild.id] = time.time()
 
+        # Bridge async speak() to sync Flask thread
         future = asyncio.run_coroutine_threadsafe(
             speak(target_vc, text),
             bot.loop
         )
         future.result(timeout=15)
+        print(f"TTS success: {text[:100]}", flush=True)
         return jsonify({'ok': True, 'text': text})
 
     except Exception as e:
+        import traceback
         print("TTS Endpoint Error:", e, flush=True)
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 # ================= END TTS ENDPOINT =================
@@ -153,15 +166,16 @@ def ask_ai(guild_id, prompt):
 # ================= SPEAK =================
 
 async def speak(vc, text):
-    try:
-        output_file = "response.mp3"
+    output_file = f"response_{int(time.time() * 1000)}.mp3"
 
+    def cleanup_file(error):
         if os.path.exists(output_file):
             try:
                 os.remove(output_file)
-            except:
-                pass
+            except Exception as e:
+                print("TTS cleanup error:", e, flush=True)
 
+    try:
         communicate = edge_tts.Communicate(
             text=text,
             voice="en-US-GuyNeural"
@@ -177,12 +191,13 @@ async def speak(vc, text):
             executable=FFMPEG_PATH
         )
 
-        vc.play(source)
+        vc.play(source, after=cleanup_file)
 
         print("Speaking:", text)
 
     except Exception as e:
-        print("VOICE ERROR:", e)
+        print("VOICE ERROR:", e, flush=True)
+        cleanup_file(None)
 
 # ================= AUTO DISCONNECT =================
 
@@ -403,6 +418,16 @@ async def play(ctx, *, query):
         print("PLAY COMMAND FAILED", flush=True)
         traceback.print_exc()
         await ctx.send("song broke")
+
+# ================= COMMAND ERROR LOGGING =================
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        return
+    import traceback
+    print(f"COMMAND ERROR (command={ctx.command}): {error}", flush=True)
+    traceback.print_exception(type(error), error, error.__traceback__)
 
 # ================= READY =================
 
