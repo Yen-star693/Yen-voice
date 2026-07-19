@@ -21,14 +21,11 @@ def home():
     return "Yen Voice Bot Online"
 
 # ================= TTS HTTP ENDPOINT =================
-# Add API_SECRET as an environment variable on Render.
-# The Android app sends this as the X-Api-Key header.
 
 API_SECRET = os.getenv("API_SECRET", "")
 
 @app.route('/tts', methods=['POST'])
 def tts_endpoint():
-    # Verify secret
     provided_key = request.headers.get('X-Api-Key', '')
     if not API_SECRET or provided_key != API_SECRET:
         return jsonify({'error': 'unauthorized'}), 401
@@ -39,7 +36,6 @@ def tts_endpoint():
     if not text:
         return jsonify({'error': 'no text provided'}), 400
 
-    # Find active voice client (optional: pass guild_id in request body to target a specific server)
     target_vc = None
     guild_id_param = data.get('guild_id')
 
@@ -57,10 +53,8 @@ def tts_endpoint():
         return jsonify({'error': 'bot not in any voice channel'}), 404
 
     try:
-        # Update idle timer so bot doesn't auto-disconnect mid-speech
         last_activity[target_vc.guild.id] = time.time()
 
-        # Bridge async speak() to sync Flask thread
         future = asyncio.run_coroutine_threadsafe(
             speak(target_vc, text),
             bot.loop
