@@ -432,6 +432,7 @@ async def chaos(ctx):
             for _ in range(3)
         )
 
+        print(f"CHAOS RUNNING: {query}")
         await ctx.send(f"chaos search: {query}")
 
         await play(ctx, query=query)
