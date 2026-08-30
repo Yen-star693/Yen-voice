@@ -848,30 +848,35 @@ async def play(ctx, *, query):
 
         player = get_player(ctx.guild.id)
 
-        loading_msg = await ctx.send(embed=status_embed(f"Searching for \"{query}\"..."))
-
-        search_query = query if query.startswith("http") else f"scsearch1:{query}"
-
-        loop = asyncio.get_event_loop()
-        try:
-            filename, title, duration = await loop.run_in_executor(None, _download_song, search_query)
-        except yt_dlp.utils.DownloadError:
-            return await loading_msg.edit(embed=status_embed(f"Couldn't find a song matching \"{query}\".", error=True))
-
-        song = {
-            "filename": filename,
-            "title": title,
-            "duration": duration,
-            "requester": str(ctx.author.display_name),
-            "text_channel": ctx.channel,
-        }
-
+        # Acquire lock early to prevent two concurrent play commands from both
+        # thinking they're the first to play and both sending "Searching..." messages
         async with player["lock"]:
-            if player["current"] is None and not vc.is_playing():
+            loading_msg = await ctx.send(embed=status_embed(f"Searching for \"{query}\"..."))
+
+            search_query = query if query.startswith("http") else f"scsearch1:{query}"
+
+            loop = asyncio.get_event_loop()
+            try:
+                filename, title, duration = await loop.run_in_executor(None, _download_song, search_query)
+            except yt_dlp.utils.DownloadError:
+                return await loading_msg.edit(embed=status_embed(f"Couldn't find a song matching \"{query}\".", error=True))
+
+            song = {
+                "filename": filename,
+                "title": title,
+                "duration": duration,
+                "requester": str(ctx.author.display_name),
+                "text_channel": ctx.channel,
+            }
+
+            # Check if we should play immediately or queue.
+            # Play immediately if: nothing is currently playing and nothing is queued.
+            if player["current"] is None and not player["queue"]:
                 await _start_current(ctx.guild.id, vc, song, seek_seconds=0)
                 await loading_msg.delete()
                 await _send_or_update_now_playing_panel(ctx.channel, ctx.guild.id)
             else:
+                # Something is playing or already queued: add to queue
                 player["queue"].append(song)
                 position = len(player["queue"])
                 embed = discord.Embed(title="Added to Queue", description=title)
