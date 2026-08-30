@@ -578,7 +578,8 @@ class PlayerControls(discord.ui.View):
         active_message = player.get("now_playing_message")
         return active_message is None or active_message.id != interaction.message.id
 
-    async def _refresh(self, interaction, player):
+    async def _refresh(self, interaction):
+        player = get_player(self.guild_id)
         embed = _build_now_playing_embed(player)
         if embed is None:
             await interaction.message.edit(content="nothing is playing", embed=None, view=None)
@@ -602,7 +603,7 @@ class PlayerControls(discord.ui.View):
                 return
             new_pos = max(0, current_elapsed(player) - SEEK_STEP)
             await _start_current(self.guild_id, vc, player["current"], seek_seconds=new_pos)
-            await self._refresh(interaction, player)
+            await self._refresh(interaction)
 
     @discord.ui.button(label="Forward 10s", style=discord.ButtonStyle.secondary, row=0)
     async def forward_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -623,7 +624,7 @@ class PlayerControls(discord.ui.View):
             if duration and new_pos >= duration:
                 new_pos = max(0, duration - 1)
             await _start_current(self.guild_id, vc, player["current"], seek_seconds=new_pos)
-            await self._refresh(interaction, player)
+            await self._refresh(interaction)
 
     @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger, row=1)
     async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -685,7 +686,7 @@ class PlayerControls(discord.ui.View):
                 except:
                     pass
 
-            await self._refresh(interaction, player)
+            await self._refresh(interaction)
 
 async def _update_now_playing_embed(message, player, guild_id):
     """Refresh the embed on an existing message with current playback state."""
