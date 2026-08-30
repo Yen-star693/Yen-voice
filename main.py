@@ -565,6 +565,128 @@ def _build_now_playing_embed(player):
     embed.set_footer(text=f"Requested by: {song['requester']}")
     return embed
 
+class PlayerControls(discord.ui.View):
+    """Button controls for the Now Playing embed: rewind, forward, stop, skip.
+    Checks message ID to prevent stale embeds' buttons from affecting the current song."""
+
+    def __init__(self, guild_id):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+
+    def _is_stale(self, interaction):
+        player = get_player(self.guild_id)
+        active_message = player.get("now_playing_message")
+        return active_message is None or active_message.id != interaction.message.id
+
+    async def _refresh(self, interaction, player):
+        embed = _build_now_playing_embed(player)
+        if embed is None:
+            await interaction.message.edit(content="nothing is playing", embed=None, view=None)
+            player["now_playing_message"] = None
+        else:
+            await interaction.message.edit(embed=embed, view=self)
+
+    @discord.ui.button(label="Rewind 10s", style=discord.ButtonStyle.secondary, row=0)
+    async def rewind_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        if self._is_stale(interaction):
+            return
+
+        vc = interaction.guild.voice_client
+        if not vc or not vc.is_connected():
+            return
+
+        player = get_player(self.guild_id)
+        async with player["lock"]:
+            if player["current"] is None:
+                return
+            new_pos = max(0, current_elapsed(player) - SEEK_STEP)
+            await _start_current(self.guild_id, vc, player["current"], seek_seconds=new_pos)
+            await self._refresh(interaction, player)
+
+    @discord.ui.button(label="Forward 10s", style=discord.ButtonStyle.secondary, row=0)
+    async def forward_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        if self._is_stale(interaction):
+            return
+
+        vc = interaction.guild.voice_client
+        if not vc or not vc.is_connected():
+            return
+
+        player = get_player(self.guild_id)
+        async with player["lock"]:
+            if player["current"] is None:
+                return
+            new_pos = current_elapsed(player) + SEEK_STEP
+            duration = player["current"].get("duration")
+            if duration and new_pos >= duration:
+                new_pos = max(0, duration - 1)
+            await _start_current(self.guild_id, vc, player["current"], seek_seconds=new_pos)
+            await self._refresh(interaction, player)
+
+    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger, row=1)
+    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        if self._is_stale(interaction):
+            return
+
+        vc = interaction.guild.voice_client
+        if not vc or not vc.is_connected():
+            return
+
+        player = get_player(self.guild_id)
+        async with player["lock"]:
+            if vc.is_playing() or vc.is_paused():
+                vc.stop()
+            await interaction.message.edit(content="stopped", embed=None, view=None)
+            player["now_playing_message"] = None
+
+    @discord.ui.button(label="Skip", style=discord.ButtonStyle.primary, row=1)
+    async def skip_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        if self._is_stale(interaction):
+            return
+
+        vc = interaction.guild.voice_client
+        if not vc or not vc.is_connected():
+            return
+
+        player = get_player(self.guild_id)
+        async with player["lock"]:
+            if player["current"] is None and not player["queue"]:
+                return
+
+            old = player["current"]
+
+            if not player["queue"]:
+                if vc.is_playing() or vc.is_paused():
+                    vc.stop()
+                else:
+                    if old and old.get("filename") and os.path.exists(old["filename"]):
+                        try:
+                            os.remove(old["filename"])
+                        except:
+                            pass
+                    player["current"] = None
+                    player["position"] = 0.0
+                    player["started_at"] = None
+                    player["speed"] = 1
+                await interaction.message.edit(content="skipped. queue is empty", embed=None, view=None)
+                player["now_playing_message"] = None
+                return
+
+            next_song = player["queue"].pop(0)
+            await _start_current(self.guild_id, vc, next_song, seek_seconds=0)
+
+            if old and old.get("filename") and os.path.exists(old["filename"]):
+                try:
+                    os.remove(old["filename"])
+                except:
+                    pass
+
+            await self._refresh(interaction, player)
+
 async def _update_now_playing_embed(message, player, guild_id):
     """Refresh the embed on an existing message with current playback state."""
     try:
@@ -575,23 +697,17 @@ async def _update_now_playing_embed(message, player, guild_id):
         print(f"Failed to update embed for guild {guild_id}: {e}", flush=True)
 
 async def _send_now_playing_panel(channel, guild_id):
-    """Sends a fresh Now Playing embed with reactions, and tracks it
-    as the guild's active panel so old panels' reactions become inert."""
+    """Sends a fresh Now Playing embed with button controls, and tracks it
+    as the guild's active panel so old panels' buttons become inert."""
     player = get_player(guild_id)
     embed = _build_now_playing_embed(player)
     if embed is None:
         return None
 
     try:
-        message = await channel.send(embed=embed)
+        view = PlayerControls(guild_id)
+        message = await channel.send(embed=embed, view=view)
         player["now_playing_message"] = message
-        
-        # Add reaction controls
-        await message.add_reaction("⏪")  # rewind
-        await message.add_reaction("⏩")  # forward
-        await message.add_reaction("⏹")  # stop
-        await message.add_reaction("⏭")  # skip
-        
         return message
     except Exception as e:
         print(f"Failed to send Now Playing panel: {e}", flush=True)
@@ -866,102 +982,6 @@ async def on_command_error(ctx, error):
     import traceback
     print(f"COMMAND ERROR (command={ctx.command}): {error}", flush=True)
     traceback.print_exception(type(error), error, error.__traceback__)
-
-# ================= REACTION CONTROLS =================
-
-@bot.event
-async def on_reaction_add(reaction, user):
-    """Handle reactions on Now Playing embeds: ⏪ ⏩ ⏹ ⏭"""
-    if user.bot:
-        return
-    
-    message = reaction.message
-    if not message.guild:
-        return
-    
-    player = get_player(message.guild.id)
-    active_msg = player.get("now_playing_message")
-    
-    # Ignore reactions on stale/inactive Now Playing messages
-    if active_msg is None or active_msg.id != message.id:
-        return
-    
-    vc = message.guild.voice_client
-    if not vc or not vc.is_connected():
-        return
-    
-    try:
-        emoji = reaction.emoji
-        
-        if emoji == "⏪":  # Rewind
-            async with player["lock"]:
-                if player["current"] is None:
-                    return
-                new_pos = max(0, current_elapsed(player) - SEEK_STEP)
-                await _start_current(message.guild.id, vc, player["current"], seek_seconds=new_pos)
-                await _update_now_playing_embed(message, player, message.guild.id)
-        
-        elif emoji == "⏩":  # Forward
-            async with player["lock"]:
-                if player["current"] is None:
-                    return
-                new_pos = current_elapsed(player) + SEEK_STEP
-                duration = player["current"].get("duration")
-                if duration and new_pos >= duration:
-                    new_pos = max(0, duration - 1)
-                await _start_current(message.guild.id, vc, player["current"], seek_seconds=new_pos)
-                await _update_now_playing_embed(message, player, message.guild.id)
-        
-        elif emoji == "⏹":  # Stop
-            async with player["lock"]:
-                if vc.is_playing() or vc.is_paused():
-                    vc.stop()
-                await message.edit(content="stopped", embed=None)
-                player["now_playing_message"] = None
-        
-        elif emoji == "⏭":  # Skip
-            async with player["lock"]:
-                if player["current"] is None and not player["queue"]:
-                    return
-                
-                old = player["current"]
-                
-                if not player["queue"]:
-                    if vc.is_playing() or vc.is_paused():
-                        vc.stop()
-                    else:
-                        if old and old.get("filename") and os.path.exists(old["filename"]):
-                            try:
-                                os.remove(old["filename"])
-                            except:
-                                pass
-                        player["current"] = None
-                        player["position"] = 0.0
-                        player["started_at"] = None
-                        player["speed"] = 1
-                    await message.edit(content="skipped. queue is empty", embed=None)
-                    player["now_playing_message"] = None
-                    return
-                
-                next_song = player["queue"].pop(0)
-                await _start_current(message.guild.id, vc, next_song, seek_seconds=0)
-                
-                if old and old.get("filename") and os.path.exists(old["filename"]):
-                    try:
-                        os.remove(old["filename"])
-                    except:
-                        pass
-                
-                await _update_now_playing_embed(message, player, message.guild.id)
-        
-        # Remove the reaction after handling
-        try:
-            await reaction.remove(user)
-        except:
-            pass
-    
-    except Exception as e:
-        print(f"Reaction handler error: {e}", flush=True)
 
 # ================= LIVE PROGRESS UPDATE LOOP =================
 
