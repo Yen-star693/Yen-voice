@@ -132,8 +132,19 @@ def get_player(guild_id):
             "started_at": None,
             "lock": asyncio.Lock(),
             "now_playing_message": None,
+            "suppress_advance": False,
         }
     return players[guild_id]
+
+def status_embed(message, error=False):
+    """Small embed wrapper for plain status/error replies, so every command
+    response looks consistent instead of mixing plain text and embeds."""
+    embed = discord.Embed(
+        title="Error" if error else "Yen Music",
+        description=message,
+        color=discord.Color.red() if error else discord.Color.blurple(),
+    )
+    return embed
 
 def format_duration(seconds):
     if seconds is None:
@@ -270,20 +281,20 @@ async def join(ctx, *, vc_link=None):
         if vc_link:
             match = re.search(r'/channels/(\d+)/(\d+)', vc_link)
             if not match:
-                return await ctx.send("invalid vc link")
+                return await ctx.send(embed=status_embed("Invalid voice channel link.", error=True))
 
             guild = bot.get_guild(int(match.group(1)))
             channel = bot.get_channel(int(match.group(2)))
 
             if not guild or not channel:
-                return await ctx.send("not found")
+                return await ctx.send(embed=status_embed("Couldn't find that server or channel.", error=True))
 
             if not isinstance(channel, discord.VoiceChannel):
-                return await ctx.send("not a vc")
+                return await ctx.send(embed=status_embed("That's not a voice channel.", error=True))
 
         else:
             if not ctx.author.voice:
-                return await ctx.send("join vc first")
+                return await ctx.send(embed=status_embed("Join a voice channel first.", error=True))
 
             channel = ctx.author.voice.channel
 
@@ -291,7 +302,7 @@ async def join(ctx, *, vc_link=None):
 
         if vc and vc.is_connected():
             if vc.channel == channel:
-                return await ctx.send("already there")
+                return await ctx.send(embed=status_embed(f"Already connected to {channel.name}."))
             await vc.move_to(channel)
         else:
             vc = await channel.connect()
@@ -299,12 +310,12 @@ async def join(ctx, *, vc_link=None):
         last_activity[ctx.guild.id] = time.time()
         asyncio.create_task(auto_disconnect(ctx.guild.id))
 
-        await ctx.send(f"joined {channel.name}")
+        await ctx.send(embed=status_embed(f"Joined {channel.name}."))
         print("Joined VC:", channel.name)
 
     except Exception as e:
         print("Join Error:", repr(e))
-        await ctx.send("couldn't join vc")
+        await ctx.send(embed=status_embed("Couldn't join that voice channel.", error=True))
 
 # ================= LEAVE =================
 
@@ -330,10 +341,12 @@ async def leave(ctx):
             player["position"] = 0.0
             player["started_at"] = None
             player["speed"] = 1
+            player["now_playing_message"] = None
 
-        await ctx.send("bye")
+        await ctx.send(embed=status_embed("Left the voice channel."))
     except Exception as e:
         print("Leave Error:", e)
+        await ctx.send(embed=status_embed("Couldn't leave the voice channel.", error=True))
 
 # ================= STOP =================
 
@@ -343,9 +356,12 @@ async def stop(ctx):
         vc = ctx.guild.voice_client
         if vc and vc.is_playing():
             vc.stop()
-            await ctx.send("stopped")
+            await ctx.send(embed=status_embed("Playback stopped."))
+        else:
+            await ctx.send(embed=status_embed("Nothing is playing.", error=True))
     except Exception as e:
         print("Stop Error:", e)
+        await ctx.send(embed=status_embed("Couldn't stop playback.", error=True))
 
 # ================= ASK (VOICE) =================
 
@@ -355,10 +371,10 @@ async def ask(ctx, *, question):
         vc = ctx.guild.voice_client
 
         if not vc or not vc.is_connected():
-            return await ctx.send("im not in vc")
+            return await ctx.send(embed=status_embed("Not connected to a voice channel.", error=True))
 
         if not ctx.author.voice or ctx.author.voice.channel != vc.channel:
-            return await ctx.send("you gotta be in my vc")
+            return await ctx.send(embed=status_embed("You need to be in the same voice channel.", error=True))
 
         last_activity[ctx.guild.id] = time.time()
         response = ask_ai(ctx.guild.id, question)
@@ -366,7 +382,7 @@ async def ask(ctx, *, question):
 
     except Exception as e:
         print("Ask Error:", e)
-        await ctx.send("voice broke")
+        await ctx.send(embed=status_embed("Something went wrong processing that.", error=True))
 
 # ================= AUTO CHAT =================
 
@@ -408,17 +424,17 @@ async def respond(ctx, *, text):
         vc = ctx.guild.voice_client
 
         if not vc or not vc.is_connected():
-            return await ctx.send("im not in vc")
+            return await ctx.send(embed=status_embed("Not connected to a voice channel.", error=True))
 
         if not ctx.author.voice or ctx.author.voice.channel != vc.channel:
-            return await ctx.send("you gotta be in my vc")
+            return await ctx.send(embed=status_embed("You need to be in the same voice channel.", error=True))
 
         last_activity[ctx.guild.id] = time.time()
         await speak(vc, text)
 
     except Exception as e:
         print("Respond Error:", e)
-        await ctx.send("voice broke")
+        await ctx.send(embed=status_embed("Something went wrong with voice playback.", error=True))
 
 # ================= PLAY / QUEUE ENGINE =================
 
@@ -455,8 +471,15 @@ def _play_finished(guild_id, error):
         print(f"Advance error in guild {guild_id}:", e, flush=True)
 
 async def _advance(guild_id):
-    """Called when a song naturally finishes. Moves to next queued song, if any."""
+    """Called when a song naturally finishes. Moves to next queued song, if any.
+    Skipped entirely if the stop() that triggered this was an intentional
+    seek/speed-change/skip rather than the song actually ending."""
     player = get_player(guild_id)
+
+    if player["suppress_advance"]:
+        player["suppress_advance"] = False
+        return
+
     async with player["lock"]:
         # Clean up the finished song's file
         old = player["current"]
@@ -485,16 +508,20 @@ async def _advance(guild_id):
         channel = next_song.get("text_channel")
         if channel:
             try:
-                await _send_now_playing_panel(channel, guild_id)
+                await _send_or_update_now_playing_panel(channel, guild_id)
             except:
                 pass
 
-async def _start_current(guild_id, vc, song, seek_seconds=0):
+async def _start_current(guild_id, vc, song, seek_seconds=0, is_reseek=False):
     """Actually start FFmpeg playback for `song`. Caller must hold player['lock'].
-    This is the ONLY place vc.play() is called, preventing double-plays."""
+    This is the ONLY place vc.play() is called, preventing double-plays.
+    is_reseek=True means this is a seek/speed-change on the SAME song, so the
+    upcoming vc.stop() call is intentional and must not trigger auto-advance."""
     player = get_player(guild_id)
 
     if vc.is_playing() or vc.is_paused():
+        if is_reseek:
+            player["suppress_advance"] = True
         vc.stop()
 
     source = _build_source(song["filename"], seek_seconds=seek_seconds, speed=player["speed"])
@@ -584,7 +611,7 @@ class PlayerControls(discord.ui.View):
         embed = _build_now_playing_embed(player)
         try:
             if embed is None:
-                await interaction.message.edit(content="nothing is playing", embed=None, view=None)
+                await interaction.message.edit(content=None, embed=status_embed("Nothing is playing."), view=None)
                 player["now_playing_message"] = None
             else:
                 # Always keep the view attached when editing
@@ -609,7 +636,7 @@ class PlayerControls(discord.ui.View):
             if player["current"] is None:
                 return
             new_pos = max(0, current_elapsed(player) - SEEK_STEP)
-            await _start_current(self.guild_id, vc, player["current"], seek_seconds=new_pos)
+            await _start_current(self.guild_id, vc, player["current"], seek_seconds=new_pos, is_reseek=True)
             await self._refresh(interaction)
 
     @discord.ui.button(label="Forward 10s", style=discord.ButtonStyle.secondary, row=0)
@@ -630,7 +657,7 @@ class PlayerControls(discord.ui.View):
             duration = player["current"].get("duration")
             if duration and new_pos >= duration:
                 new_pos = max(0, duration - 1)
-            await _start_current(self.guild_id, vc, player["current"], seek_seconds=new_pos)
+            await _start_current(self.guild_id, vc, player["current"], seek_seconds=new_pos, is_reseek=True)
             await self._refresh(interaction)
 
     @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger, row=1)
@@ -647,7 +674,7 @@ class PlayerControls(discord.ui.View):
         async with player["lock"]:
             if vc.is_playing() or vc.is_paused():
                 vc.stop()
-            await interaction.message.edit(content="stopped", embed=None, view=None)
+            await interaction.message.edit(content=None, embed=status_embed("Playback stopped."), view=None)
             player["now_playing_message"] = None
 
     @discord.ui.button(label="Skip", style=discord.ButtonStyle.primary, row=1)
@@ -680,7 +707,7 @@ class PlayerControls(discord.ui.View):
                     player["position"] = 0.0
                     player["started_at"] = None
                     player["speed"] = 1
-                await interaction.message.edit(content="skipped. queue is empty", embed=None, view=None)
+                await interaction.message.edit(content=None, embed=status_embed("Skipped. Queue is now empty."), view=None)
                 player["now_playing_message"] = None
                 return
 
@@ -709,40 +736,28 @@ async def _update_now_playing_embed(message, player, guild_id):
         print(f"Failed to update embed for guild {guild_id}: {e}", flush=True)
 
 async def _send_or_update_now_playing_panel(channel, guild_id):
-    """Send a new Now Playing panel, or update the existing one if it's already posted."""
+    """Send a new Now Playing panel, or update the existing one if it's already posted.
+    Falls back to sending a new message if the old one was deleted/inaccessible."""
     player = get_player(guild_id)
     embed = _build_now_playing_embed(player)
     if embed is None:
         return None
 
     existing_msg = player.get("now_playing_message")
-    
-    try:
-        if existing_msg:
-            # Edit the existing message
-            view = PlayerControls(guild_id)
+    view = PlayerControls(guild_id)
+
+    if existing_msg:
+        try:
             await existing_msg.edit(embed=embed, view=view)
             return existing_msg
-        else:
-            # Send a new message
-            view = PlayerControls(guild_id)
-            message = await channel.send(embed=embed, view=view)
-            player["now_playing_message"] = message
-            return message
-    except Exception as e:
-        print(f"Failed to send/update Now Playing panel: {e}", flush=True)
-        return None
-
-async def _send_now_playing_panel(channel, guild_id):
-    """Sends a fresh Now Playing embed with button controls, and tracks it
-    as the guild's active panel so old panels' buttons become inert."""
-    player = get_player(guild_id)
-    embed = _build_now_playing_embed(player)
-    if embed is None:
-        return None
+        except (discord.NotFound, discord.HTTPException):
+            # Old message is gone; fall through to sending a new one
+            player["now_playing_message"] = None
+        except Exception as e:
+            print(f"Failed to edit Now Playing panel: {e}", flush=True)
+            player["now_playing_message"] = None
 
     try:
-        view = PlayerControls(guild_id)
         message = await channel.send(embed=embed, view=view)
         player["now_playing_message"] = message
         return message
@@ -775,9 +790,10 @@ def _download_song(search_query):
 
 @bot.command()
 async def play(ctx, *, query):
+    loading_msg = None
     try:
         if not ctx.author.voice:
-            return await ctx.send("join vc first")
+            return await ctx.send(embed=status_embed("Join a voice channel first.", error=True))
 
         channel = ctx.author.voice.channel
         vc = ctx.guild.voice_client
@@ -789,12 +805,15 @@ async def play(ctx, *, query):
 
         player = get_player(ctx.guild.id)
 
-        await ctx.send("loading song...")
+        loading_msg = await ctx.send(embed=status_embed(f"Searching for \"{query}\"..."))
 
         search_query = query if query.startswith("http") else f"scsearch1:{query}"
 
         loop = asyncio.get_event_loop()
-        filename, title, duration = await loop.run_in_executor(None, _download_song, search_query)
+        try:
+            filename, title, duration = await loop.run_in_executor(None, _download_song, search_query)
+        except yt_dlp.utils.DownloadError:
+            return await loading_msg.edit(embed=status_embed(f"Couldn't find a song matching \"{query}\".", error=True))
 
         song = {
             "filename": filename,
@@ -807,24 +826,29 @@ async def play(ctx, *, query):
         async with player["lock"]:
             if player["current"] is None and not vc.is_playing():
                 await _start_current(ctx.guild.id, vc, song, seek_seconds=0)
-                await _send_now_playing_panel(ctx.channel, ctx.guild.id)
+                await loading_msg.delete()
+                await _send_or_update_now_playing_panel(ctx.channel, ctx.guild.id)
             else:
                 player["queue"].append(song)
                 position = len(player["queue"])
-                lines = [
-                    "Added to queue",
-                    title,
-                    f"Duration: {format_duration(duration)}",
-                    f"Position in queue: {position}",
-                    f"Requested by: {ctx.author.display_name}",
-                ]
-                await ctx.send("\n".join(lines))
+                embed = discord.Embed(title="Added to Queue", description=title)
+                embed.add_field(name="Duration", value=format_duration(duration), inline=True)
+                embed.add_field(name="Position in queue", value=str(position), inline=True)
+                embed.set_footer(text=f"Requested by: {ctx.author.display_name}")
+                await loading_msg.edit(embed=embed)
 
-    except Exception:
+    except Exception as e:
+        print("PLAY COMMAND FAILED:", e, flush=True)
         import traceback
-        print("PLAY COMMAND FAILED", flush=True)
         traceback.print_exc()
-        await ctx.send("song broke")
+        error_embed = status_embed("Something went wrong trying to play that. Try again in a moment.", error=True)
+        if loading_msg:
+            try:
+                await loading_msg.edit(embed=error_embed)
+                return
+            except:
+                pass
+        await ctx.send(embed=error_embed)
 
 # ================= SKIP =================
 
@@ -833,13 +857,13 @@ async def skip(ctx):
     try:
         vc = ctx.guild.voice_client
         if not vc or not vc.is_connected():
-            return await ctx.send("im not in vc")
+            return await ctx.send(embed=status_embed("Not connected to a voice channel.", error=True))
 
         player = get_player(ctx.guild.id)
 
         async with player["lock"]:
             if player["current"] is None and not player["queue"]:
-                return await ctx.send("nothing to skip")
+                return await ctx.send(embed=status_embed("Nothing to skip.", error=True))
 
             if not player["queue"]:
                 # No next song: stop cleanly, clear state, let _advance's cleanup run via stop's after=
@@ -857,7 +881,7 @@ async def skip(ctx):
                     player["position"] = 0.0
                     player["started_at"] = None
                     player["speed"] = 1
-                await ctx.send("skipped. queue is empty")
+                await ctx.send(embed=status_embed("Skipped. Queue is now empty."))
                 return
 
             # There's a next song: pop it, stop current (triggers _advance via after=,
@@ -878,7 +902,7 @@ async def skip(ctx):
 
     except Exception as e:
         print("Skip Error:", e, flush=True)
-        await ctx.send("skip broke")
+        await ctx.send(embed=status_embed("Something went wrong skipping.", error=True))
 
 # ================= FORWARD / REWIND (SEEK) =================
 
@@ -887,47 +911,47 @@ async def forward(ctx):
     try:
         vc = ctx.guild.voice_client
         if not vc or not vc.is_connected():
-            return await ctx.send("im not in vc")
+            return await ctx.send(embed=status_embed("Not connected to a voice channel.", error=True))
 
         player = get_player(ctx.guild.id)
 
         async with player["lock"]:
             if player["current"] is None:
-                return await ctx.send("nothing is playing")
+                return await ctx.send(embed=status_embed("Nothing is playing.", error=True))
 
             new_pos = current_elapsed(player) + SEEK_STEP
             duration = player["current"].get("duration")
             if duration and new_pos >= duration:
                 new_pos = max(0, duration - 1)
 
-            await _start_current(ctx.guild.id, vc, player["current"], seek_seconds=new_pos)
+            await _start_current(ctx.guild.id, vc, player["current"], seek_seconds=new_pos, is_reseek=True)
             await _send_or_update_now_playing_panel(ctx.channel, ctx.guild.id)
 
     except Exception as e:
         print("Forward Error:", e, flush=True)
-        await ctx.send("seek broke")
+        await ctx.send(embed=status_embed("Something went wrong seeking.", error=True))
 
 @bot.command()
 async def rewind(ctx):
     try:
         vc = ctx.guild.voice_client
         if not vc or not vc.is_connected():
-            return await ctx.send("im not in vc")
+            return await ctx.send(embed=status_embed("Not connected to a voice channel.", error=True))
 
         player = get_player(ctx.guild.id)
 
         async with player["lock"]:
             if player["current"] is None:
-                return await ctx.send("nothing is playing")
+                return await ctx.send(embed=status_embed("Nothing is playing.", error=True))
 
             new_pos = max(0, current_elapsed(player) - SEEK_STEP)
 
-            await _start_current(ctx.guild.id, vc, player["current"], seek_seconds=new_pos)
+            await _start_current(ctx.guild.id, vc, player["current"], seek_seconds=new_pos, is_reseek=True)
             await _send_or_update_now_playing_panel(ctx.channel, ctx.guild.id)
 
     except Exception as e:
         print("Rewind Error:", e, flush=True)
-        await ctx.send("seek broke")
+        await ctx.send(embed=status_embed("Something went wrong seeking.", error=True))
 
 # ================= SPEED TOGGLE =================
 
@@ -936,23 +960,23 @@ async def speed(ctx):
     try:
         vc = ctx.guild.voice_client
         if not vc or not vc.is_connected():
-            return await ctx.send("im not in vc")
+            return await ctx.send(embed=status_embed("Not connected to a voice channel.", error=True))
 
         player = get_player(ctx.guild.id)
 
         async with player["lock"]:
             if player["current"] is None:
-                return await ctx.send("nothing is playing")
+                return await ctx.send(embed=status_embed("Nothing is playing.", error=True))
 
             current_pos = current_elapsed(player)
             player["speed"] = 2 if player["speed"] == 1 else 1
 
-            await _start_current(ctx.guild.id, vc, player["current"], seek_seconds=current_pos)
+            await _start_current(ctx.guild.id, vc, player["current"], seek_seconds=current_pos, is_reseek=True)
             await _send_or_update_now_playing_panel(ctx.channel, ctx.guild.id)
 
     except Exception as e:
         print("Speed Error:", e, flush=True)
-        await ctx.send("speed toggle broke")
+        await ctx.send(embed=status_embed("Something went wrong changing speed.", error=True))
 
 # ================= NOW PLAYING =================
 
@@ -964,10 +988,10 @@ async def nowplaying(ctx):
         if embed:
             await ctx.send(embed=embed)
         else:
-            await ctx.send("nothing is playing")
+            await ctx.send(embed=status_embed("Nothing is playing.", error=True))
     except Exception as e:
         print("NowPlaying Error:", e, flush=True)
-        await ctx.send("couldn't get now playing info")
+        await ctx.send(embed=status_embed("Couldn't get now playing info.", error=True))
 
 # ================= QUEUE VIEW =================
 
@@ -977,7 +1001,7 @@ async def queue(ctx):
         player = get_player(ctx.guild.id)
 
         if player["current"] is None and not player["queue"]:
-            return await ctx.send("queue is empty")
+            return await ctx.send(embed=status_embed("Queue is empty.", error=True))
 
         embed = discord.Embed(title="Queue")
         
@@ -1002,13 +1026,13 @@ async def queue(ctx):
         await ctx.send(embed=embed)
     except Exception as e:
         print("Queue Error:", e, flush=True)
-        await ctx.send("couldn't get queue")
+        await ctx.send(embed=status_embed("Couldn't get the queue.", error=True))
 
 @bot.command()
 async def chaos(ctx):
     try:
         if not ctx.author.voice:
-            return await ctx.send("join vc first")
+            return await ctx.send(embed=status_embed("Join a voice channel first.", error=True))
 
         query = ''.join(
             random.choice(string.ascii_lowercase)
@@ -1016,13 +1040,14 @@ async def chaos(ctx):
         )
 
         print(f"CHAOS RUNNING: {query}")
-        await ctx.send(f"chaos search: {query}")
+        await ctx.send(embed=status_embed(f"Chaos search: {query}"))
 
         await play(ctx, query=query)
 
     except Exception as e:
         print("Chaos Error:", e)
-        await ctx.send("chaos broke")
+        await ctx.send(embed=status_embed("Chaos mode broke.", error=True))
+
 
 
 # ================= COMMAND ERROR LOGGING =================
