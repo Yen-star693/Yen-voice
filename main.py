@@ -579,13 +579,20 @@ class PlayerControls(discord.ui.View):
         return active_message is None or active_message.id != interaction.message.id
 
     async def _refresh(self, interaction):
+        """Refresh the embed on the message, keeping the same View/buttons."""
         player = get_player(self.guild_id)
         embed = _build_now_playing_embed(player)
-        if embed is None:
-            await interaction.message.edit(content="nothing is playing", embed=None, view=None)
-            player["now_playing_message"] = None
-        else:
-            await interaction.message.edit(embed=embed, view=self)
+        try:
+            if embed is None:
+                await interaction.message.edit(content="nothing is playing", embed=None, view=None)
+                player["now_playing_message"] = None
+            else:
+                # Always keep the view attached when editing
+                await interaction.message.edit(embed=embed, view=self)
+                # Ensure the message reference is current
+                player["now_playing_message"] = interaction.message
+        except Exception as e:
+            print(f"Refresh error: {e}", flush=True)
 
     @discord.ui.button(label="Rewind 10s", style=discord.ButtonStyle.secondary, row=0)
     async def rewind_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -689,13 +696,42 @@ class PlayerControls(discord.ui.View):
             await self._refresh(interaction)
 
 async def _update_now_playing_embed(message, player, guild_id):
-    """Refresh the embed on an existing message with current playback state."""
+    """Refresh the embed on an existing message, preserving the button view."""
     try:
         embed = _build_now_playing_embed(player)
         if embed:
-            await message.edit(embed=embed)
+            # Create a fresh View instance to re-attach buttons
+            view = PlayerControls(guild_id)
+            await message.edit(embed=embed, view=view)
+            # Keep the message reference current
+            player["now_playing_message"] = message
     except Exception as e:
         print(f"Failed to update embed for guild {guild_id}: {e}", flush=True)
+
+async def _send_or_update_now_playing_panel(channel, guild_id):
+    """Send a new Now Playing panel, or update the existing one if it's already posted."""
+    player = get_player(guild_id)
+    embed = _build_now_playing_embed(player)
+    if embed is None:
+        return None
+
+    existing_msg = player.get("now_playing_message")
+    
+    try:
+        if existing_msg:
+            # Edit the existing message
+            view = PlayerControls(guild_id)
+            await existing_msg.edit(embed=embed, view=view)
+            return existing_msg
+        else:
+            # Send a new message
+            view = PlayerControls(guild_id)
+            message = await channel.send(embed=embed, view=view)
+            player["now_playing_message"] = message
+            return message
+    except Exception as e:
+        print(f"Failed to send/update Now Playing panel: {e}", flush=True)
+        return None
 
 async def _send_now_playing_panel(channel, guild_id):
     """Sends a fresh Now Playing embed with button controls, and tracks it
@@ -838,7 +874,7 @@ async def skip(ctx):
                 except:
                     pass
 
-            await _send_now_playing_panel(ctx.channel, ctx.guild.id)
+            await _send_or_update_now_playing_panel(ctx.channel, ctx.guild.id)
 
     except Exception as e:
         print("Skip Error:", e, flush=True)
@@ -865,7 +901,7 @@ async def forward(ctx):
                 new_pos = max(0, duration - 1)
 
             await _start_current(ctx.guild.id, vc, player["current"], seek_seconds=new_pos)
-            await _send_now_playing_panel(ctx.channel, ctx.guild.id)
+            await _send_or_update_now_playing_panel(ctx.channel, ctx.guild.id)
 
     except Exception as e:
         print("Forward Error:", e, flush=True)
@@ -887,7 +923,7 @@ async def rewind(ctx):
             new_pos = max(0, current_elapsed(player) - SEEK_STEP)
 
             await _start_current(ctx.guild.id, vc, player["current"], seek_seconds=new_pos)
-            await _send_now_playing_panel(ctx.channel, ctx.guild.id)
+            await _send_or_update_now_playing_panel(ctx.channel, ctx.guild.id)
 
     except Exception as e:
         print("Rewind Error:", e, flush=True)
@@ -912,7 +948,7 @@ async def speed(ctx):
             player["speed"] = 2 if player["speed"] == 1 else 1
 
             await _start_current(ctx.guild.id, vc, player["current"], seek_seconds=current_pos)
-            await ctx.send(f"speed set to {player['speed']}x")
+            await _send_or_update_now_playing_panel(ctx.channel, ctx.guild.id)
 
     except Exception as e:
         print("Speed Error:", e, flush=True)
@@ -924,7 +960,11 @@ async def speed(ctx):
 async def nowplaying(ctx):
     try:
         player = get_player(ctx.guild.id)
-        await ctx.send(_now_playing_text(player, ctx.guild.id))
+        embed = _build_now_playing_embed(player)
+        if embed:
+            await ctx.send(embed=embed)
+        else:
+            await ctx.send("nothing is playing")
     except Exception as e:
         print("NowPlaying Error:", e, flush=True)
         await ctx.send("couldn't get now playing info")
@@ -939,16 +979,27 @@ async def queue(ctx):
         if player["current"] is None and not player["queue"]:
             return await ctx.send("queue is empty")
 
-        lines = []
+        embed = discord.Embed(title="Queue")
+        
         if player["current"]:
-            lines.append(_now_playing_text(player, ctx.guild.id))
+            song = player["current"]
+            elapsed = current_elapsed(player)
+            duration = song.get("duration")
+            bar = _progress_bar(elapsed, duration)
+            embed.add_field(
+                name="Now Playing",
+                value=f"{song['title']}\n{format_duration(elapsed)} / {format_duration(duration)}\n{bar}",
+                inline=False,
+            )
+            embed.set_footer(text=f"Requested by: {song['requester']}")
+        
         if player["queue"]:
-            lines.append("")
-            lines.append("Upcoming:")
+            upcoming = ""
             for i, song in enumerate(player["queue"], start=1):
-                lines.append(f"{i}. {song['title']} (requested by {song['requester']})")
+                upcoming += f"{i}. {song['title']}\n"
+            embed.add_field(name="Upcoming", value=upcoming, inline=False)
 
-        await ctx.send("\n".join(lines))
+        await ctx.send(embed=embed)
     except Exception as e:
         print("Queue Error:", e, flush=True)
         await ctx.send("couldn't get queue")
