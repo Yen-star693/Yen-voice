@@ -4,6 +4,7 @@ import requests
 import asyncio
 import edge_tts
 import os
+import atexit
 import imageio_ffmpeg
 import re
 import time
@@ -13,6 +14,33 @@ import string
 
 from flask import Flask, request, jsonify
 from threading import Thread
+
+# ================= LEADER LOCK =================
+
+LOCK_FILE = "yen_bot.lock"
+IS_LEADER = False
+
+def acquire_lock():
+    global IS_LEADER
+    try:
+        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        IS_LEADER = True
+        return True
+    except FileExistsError:
+        return False
+
+def release_lock():
+    global IS_LEADER
+    if IS_LEADER:
+        try:
+            os.remove(LOCK_FILE)
+        except FileNotFoundError:
+            pass
+        IS_LEADER = False
+
+atexit.register(release_lock)
 
 # ================= KEEP ALIVE =================
 
@@ -355,7 +383,22 @@ async def stop(ctx):
     try:
         vc = ctx.guild.voice_client
         if vc and vc.is_playing():
-            vc.stop()
+            player = get_player(ctx.guild.id)
+            async with player["lock"]:
+                if vc.is_playing():
+                    vc.stop()
+                # Clean up player state since we're intentionally stopping
+                old = player["current"]
+                if old and old.get("filename") and os.path.exists(old["filename"]):
+                    try:
+                        os.remove(old["filename"])
+                    except:
+                        pass
+                player["current"] = None
+                player["position"] = 0.0
+                player["started_at"] = None
+                player["speed"] = 1
+                player["now_playing_message"] = None
             await ctx.send(embed=status_embed("Playback stopped."))
         else:
             await ctx.send(embed=status_embed("Nothing is playing.", error=True))
@@ -1077,8 +1120,10 @@ async def _update_all_progress_bars():
                     continue
                 
                 try:
-                    # Update without the lock since we're just reading/updating the embed
-                    await _update_now_playing_embed(msg, player, guild_id)
+                    # Acquire the lock before reading player state and editing the message,
+                    # so button presses and progress updates don't race on the same message
+                    async with player["lock"]:
+                        await _update_now_playing_embed(msg, player, guild_id)
                 except Exception as e:
                     print(f"Failed to update progress for guild {guild_id}: {e}", flush=True)
         except asyncio.CancelledError:
@@ -1100,5 +1145,8 @@ async def on_ready():
 
 # ================= RUN =================
 
-keep_alive()
-bot.run(TOKEN)
+if not acquire_lock():
+    print("Another Yen instance is already running. This instance will not start.", flush=True)
+else:
+    keep_alive()
+    bot.run(TOKEN)
