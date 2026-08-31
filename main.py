@@ -245,6 +245,23 @@ def ask_ai(guild_id, prompt):
 
 # ================= SPEAK =================
 
+def detect_hindi_or_hinglish(text):
+    """Detect Hindi written in Devanagari script, or Hinglish (Hindi written in
+    Latin script). Uses Devanagari Unicode range plus a curated list of common
+    Hindi function words/particles that rarely appear in English sentences."""
+    if re.search(r'[\u0900-\u097F]', text):
+        return True
+
+    hindi_markers = {"hai", "hoon", "hun", "kar", "raha", "rahi", "rha", "nahi", "nahin",
+                      "kya", "tha", "thi", "mein", "main", "ka", "ki", "ke", "se", "aur",
+                      "ek", "he", "ho", "kaise", "kyun", "abhi", "bhi", "toh", "tum", "aap"}
+    words = re.findall(r'[a-zA-Z]+', text.lower())
+    hits = sum(1 for w in words if w in hindi_markers)
+
+    if len(words) <= 3:
+        return hits >= 1
+    return hits >= 2
+
 async def speak(vc, text):
     output_file = f"response_{int(time.time() * 1000)}.mp3"
 
@@ -256,9 +273,11 @@ async def speak(vc, text):
                 print("TTS cleanup error:", e, flush=True)
 
     try:
+        voice = "hi-IN-MadhurNeural" if detect_hindi_or_hinglish(text) else "en-US-GuyNeural"
+
         communicate = edge_tts.Communicate(
             text=text,
-            voice="en-US-GuyNeural"
+            voice=voice
         )
 
         await communicate.save(output_file)
