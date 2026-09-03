@@ -137,6 +137,7 @@ bot = commands.Bot(command_prefix="yen ", intents=intents)
 
 last_activity = {}
 conversation_history = {}
+forced_language = {}  # guild_id -> "hindi" | "english" | not set (auto-detect)
 
 # ================= PLAYER STATE =================
 # Per-guild playback state for queue/seek/speed support.
@@ -273,7 +274,15 @@ async def speak(vc, text):
                 print("TTS cleanup error:", e, flush=True)
 
     try:
-        voice = "hi-IN-MadhurNeural" if detect_hindi_or_hinglish(text) else "en-US-GuyNeural"
+        guild_id = vc.guild.id if vc.guild else None
+        override = forced_language.get(guild_id)
+
+        if override == "hindi":
+            voice = "hi-IN-MadhurNeural"
+        elif override == "english":
+            voice = "en-US-GuyNeural"
+        else:
+            voice = "hi-IN-MadhurNeural" if detect_hindi_or_hinglish(text) else "en-US-GuyNeural"
 
         communicate = edge_tts.Communicate(
             text=text,
@@ -466,14 +475,27 @@ async def on_message(message):
         if not message.author.voice or message.author.voice.channel != vc.channel:
             return
 
-        if message.content.lower().startswith("yo yen"):
-            question = message.content.lower().replace("yo yen", "", 1).strip()
+        content = message.content.strip()
+        if not content:
+            return
+
+        # Don't speak bot commands (e.g. "yen play tek") since they're not chat messages
+        if content.lower().startswith(bot.command_prefix):
+            return
+
+        if content.lower().startswith("yo yen"):
+            question = content.lower().replace("yo yen", "", 1).strip()
             if not question:
                 return
 
             last_activity[message.guild.id] = time.time()
             response = ask_ai(message.guild.id, question)
             await speak(vc, response)
+            return
+
+        # Speak everything else typed by someone in the bot's voice channel
+        last_activity[message.guild.id] = time.time()
+        await speak(vc, content)
 
     except Exception as e:
         print("Message Error:", e)
@@ -497,6 +519,26 @@ async def respond(ctx, *, text):
     except Exception as e:
         print("Respond Error:", e)
         await ctx.send(embed=status_embed("Something went wrong with voice playback.", error=True))
+
+# ================= LANGUAGE TOGGLE =================
+
+@bot.command()
+async def hindi(ctx):
+    try:
+        forced_language[ctx.guild.id] = "hindi"
+        await ctx.send(embed=status_embed("Yen will now speak everything in Hindi."))
+    except Exception as e:
+        print("Hindi Command Error:", e)
+        await ctx.send(embed=status_embed("Couldn't switch language.", error=True))
+
+@bot.command()
+async def english(ctx):
+    try:
+        forced_language[ctx.guild.id] = "english"
+        await ctx.send(embed=status_embed("Yen will now speak everything in English."))
+    except Exception as e:
+        print("English Command Error:", e)
+        await ctx.send(embed=status_embed("Couldn't switch language.", error=True))
 
 # ================= PLAY / QUEUE ENGINE =================
 
