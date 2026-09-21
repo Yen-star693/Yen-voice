@@ -493,7 +493,12 @@ async def on_message(message):
             await speak(vc, response)
             return
 
-        # Speak everything else typed by someone in the bot's voice channel
+        # Speak everything else typed by someone in the bot's voice channel,
+        # but skip if music is currently playing (don't interrupt the song)
+        player = get_player(message.guild.id)
+        if player["current"] is not None:
+            return
+
         last_activity[message.guild.id] = time.time()
         await speak(vc, content)
 
@@ -669,7 +674,7 @@ def _progress_bar(elapsed, duration, length=20):
     return "─" * pos + "●" + "─" * (length - 1 - pos)
 
 def _build_now_playing_embed(player):
-    """Builds the button-controlled Now Playing embed shown in the sketch."""
+    """Builds the button-controlled Now Playing embed with thumbnail on the left."""
     song = player["current"]
     if not song:
         return None
@@ -694,6 +699,12 @@ def _build_now_playing_embed(player):
         embed.add_field(name="Up next", value=player["queue"][0]["title"], inline=False)
 
     embed.set_footer(text=f"Requested by: {song['requester']}")
+    
+    # Add thumbnail on the left side of the embed
+    thumbnail = song.get("thumbnail")
+    if thumbnail:
+        embed.set_thumbnail(url=thumbnail)
+    
     return embed
 
 class PlayerControls(discord.ui.View):
@@ -870,7 +881,7 @@ async def _send_or_update_now_playing_panel(channel, guild_id):
         return None
 
 def _download_song(search_query):
-    """Blocking download, run in executor. Returns (filename, title, duration)."""
+    """Blocking download, run in executor. Returns (filename, title, duration, thumbnail_url)."""
     unique_id = f"{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
     outtmpl = f"song_{unique_id}.%(ext)s"
 
@@ -889,8 +900,9 @@ def _download_song(search_query):
         filename = ydl.prepare_filename(info)
         title = info.get("title", "Unknown title")
         duration = info.get("duration")
+        thumbnail = info.get("thumbnail")
 
-    return filename, title, duration
+    return filename, title, duration, thumbnail
 
 @bot.command()
 async def play(ctx, *, query):
@@ -918,7 +930,7 @@ async def play(ctx, *, query):
 
             loop = asyncio.get_event_loop()
             try:
-                filename, title, duration = await loop.run_in_executor(None, _download_song, search_query)
+                filename, title, duration, thumbnail = await loop.run_in_executor(None, _download_song, search_query)
             except yt_dlp.utils.DownloadError:
                 return await loading_msg.edit(embed=status_embed(f"Couldn't find a song matching \"{query}\".", error=True))
 
@@ -926,6 +938,7 @@ async def play(ctx, *, query):
                 "filename": filename,
                 "title": title,
                 "duration": duration,
+                "thumbnail": thumbnail,
                 "requester": str(ctx.author.display_name),
                 "text_channel": ctx.channel,
             }
