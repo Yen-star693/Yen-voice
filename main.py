@@ -1,3 +1,4 @@
+h
 import discord
 from discord.ext import commands
 import requests
@@ -158,6 +159,8 @@ def get_player(guild_id):
             "current": None,
             "position": 0.0,
             "speed": 1,
+            "volume": 1.0,
+            "source": None,
             "started_at": None,
             "lock": asyncio.Lock(),
             "now_playing_message": None,
@@ -264,6 +267,9 @@ def detect_hindi_or_hinglish(text):
     return hits >= 2
 
 async def speak(vc, text):
+    if get_player(vc.guild.id)["current"] is not None:
+        print("TTS skipped: music is playing", flush=True)
+        return
     output_file = f"response_{int(time.time() * 1000)}.mp3"
 
     def cleanup_file(error):
@@ -373,66 +379,61 @@ async def join(ctx, *, vc_link=None):
         print("Join Error:", repr(e))
         await ctx.send(embed=status_embed("Couldn't join that voice channel.", error=True))
 
-# ================= LEAVE =================
+# ================= LEAVE / STOP / VOLUME =================
 
 @bot.command()
 async def leave(ctx):
     try:
         vc = ctx.guild.voice_client
-        if vc:
-            if vc.is_playing():
-                vc.stop()
-            await vc.disconnect()
-
+        if not vc:
+            return await ctx.send(embed=status_embed("I'm not in a voice channel.", error=True))
         player = get_player(ctx.guild.id)
         async with player["lock"]:
-            for song in ([player["current"]] if player["current"] else []) + player["queue"]:
-                if song and song.get("filename") and os.path.exists(song["filename"]):
-                    try:
-                        os.remove(song["filename"])
-                    except:
-                        pass
-            player["current"] = None
-            player["queue"] = []
-            player["position"] = 0.0
-            player["started_at"] = None
-            player["speed"] = 1
-            player["now_playing_message"] = None
-
+            await _halt_playback(ctx.guild.id, vc)
+            await _close_panel(player, "Disconnected.")
+        await vc.disconnect()
         await ctx.send(embed=status_embed("Left the voice channel."))
     except Exception as e:
-        print("Leave Error:", e)
+        print("Leave Error:", e, flush=True)
         await ctx.send(embed=status_embed("Couldn't leave the voice channel.", error=True))
-
-# ================= STOP =================
 
 @bot.command()
 async def stop(ctx):
     try:
         vc = ctx.guild.voice_client
-        if vc and vc.is_playing():
-            player = get_player(ctx.guild.id)
-            async with player["lock"]:
-                if vc.is_playing():
-                    vc.stop()
-                # Clean up player state since we're intentionally stopping
-                old = player["current"]
-                if old and old.get("filename") and os.path.exists(old["filename"]):
-                    try:
-                        os.remove(old["filename"])
-                    except:
-                        pass
-                player["current"] = None
-                player["position"] = 0.0
-                player["started_at"] = None
-                player["speed"] = 1
-                player["now_playing_message"] = None
-            await ctx.send(embed=status_embed("Playback stopped."))
-        else:
-            await ctx.send(embed=status_embed("Nothing is playing.", error=True))
+        if not vc or not vc.is_connected():
+            return await ctx.send(embed=status_embed("I'm not in a voice channel.", error=True))
+        player = get_player(ctx.guild.id)
+        if player["current"] is None and not player["queue"]:
+            return await ctx.send(embed=status_embed("Nothing is playing.", error=True))
+        async with player["lock"]:
+            await _halt_playback(ctx.guild.id, vc)
+            await _close_panel(player, "Stopped.")
+        await ctx.send(embed=status_embed("Playback stopped and queue cleared."))
     except Exception as e:
-        print("Stop Error:", e)
+        print("Stop Error:", e, flush=True)
         await ctx.send(embed=status_embed("Couldn't stop playback.", error=True))
+
+@bot.command()
+async def volume(ctx, level: str = None):
+    try:
+        player = get_player(ctx.guild.id)
+        if level is None:
+            return await ctx.send(embed=status_embed(f"Volume is {round(player['volume'] * 100)}%."))
+        try:
+            percent = int(level.rstrip("%"))
+        except ValueError:
+            percent = -1
+        if not 0 <= percent <= MAX_VOLUME:
+            return await ctx.send(embed=status_embed(f"Volume must be a number from 0 to {MAX_VOLUME}.", error=True))
+        async with player["lock"]:
+            player["volume"] = percent / 100
+            if player["source"] is not None:
+                player["source"].volume = percent / 100
+        await ctx.send(embed=status_embed(f"Volume set to {percent}%."))
+    except Exception as e:
+        print("Volume Error:", e, flush=True)
+        await ctx.send(embed=status_embed("Couldn't change the volume.", error=True))
 
 # ================= ASK (VOICE) =================
 
@@ -447,6 +448,8 @@ async def ask(ctx, *, question):
         if not ctx.author.voice or ctx.author.voice.channel != vc.channel:
             return await ctx.send(embed=status_embed("You need to be in the same voice channel.", error=True))
 
+        if get_player(ctx.guild.id)["current"] is not None:
+            return await ctx.send(embed=status_embed("Music is playing. Stop it before using voice.", error=True))
         last_activity[ctx.guild.id] = time.time()
         response = ask_ai(ctx.guild.id, question)
         await speak(vc, response)
@@ -518,6 +521,8 @@ async def respond(ctx, *, text):
         if not ctx.author.voice or ctx.author.voice.channel != vc.channel:
             return await ctx.send(embed=status_embed("You need to be in the same voice channel.", error=True))
 
+        if get_player(ctx.guild.id)["current"] is not None:
+            return await ctx.send(embed=status_embed("Music is playing. Stop it before using voice.", error=True))
         last_activity[ctx.guild.id] = time.time()
         await speak(vc, text)
 
@@ -547,341 +552,244 @@ async def english(ctx):
 
 # ================= PLAY / QUEUE ENGINE =================
 
+SEEK_STEP = 10
+MAX_VOLUME = 200
+
 def _build_source(filename, seek_seconds=0, speed=1):
-    """Build an FFmpeg audio source starting at seek_seconds, at the given speed.
-    No re-download needed: filename is already on disk."""
+    """FFmpeg source starting at seek_seconds, optionally at 2x speed.
+    The file is already on disk, so seeking never re-downloads anything."""
     if not filename or not os.path.exists(filename):
         raise FileNotFoundError(f"Audio file not found: {filename}")
-    
-    before_opts = f"-ss {max(0, seek_seconds):.2f}"
-    options = None
-    if speed == 2:
-        options = "-filter:a atempo=2.0"
-    
-    try:
-        return discord.FFmpegPCMAudio(
-            filename,
-            executable=FFMPEG_PATH,
-            before_options=before_opts,
-            options=options,
-        )
-    except Exception as e:
-        print(f"FFmpeg source error for {filename}: {e}", flush=True)
-        raise
+    options = "-filter:a atempo=2.0" if speed == 2 else None
+    return discord.FFmpegPCMAudio(
+        filename,
+        executable=FFMPEG_PATH,
+        before_options=f"-ss {max(0, seek_seconds):.2f}",
+        options=options,
+    )
+
+def _delete_file(path):
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError as e:
+            print("File cleanup error:", e, flush=True)
+
+def _log_advance_failure(guild_id, future):
+    if future.cancelled():
+        return
+    exc = future.exception()
+    if exc:
+        print(f"Advance error in guild {guild_id}:", exc, flush=True)
 
 def _play_finished(guild_id, error):
-    """after= callback from vc.play(). Must be sync; schedules the async continuation."""
+    """after= callback, run on discord.py's audio thread. Schedules _advance on
+    the event loop and returns immediately instead of blocking that thread."""
     if error:
         print(f"Playback error in guild {guild_id}:", error, flush=True)
-    fut = asyncio.run_coroutine_threadsafe(_advance(guild_id), bot.loop)
-    try:
-        fut.result(timeout=10)
-    except Exception as e:
-        print(f"Advance error in guild {guild_id}:", e, flush=True)
+    future = asyncio.run_coroutine_threadsafe(_advance(guild_id), bot.loop)
+    future.add_done_callback(lambda f: _log_advance_failure(guild_id, f))
 
 async def _advance(guild_id):
-    """Called when a song naturally finishes. Moves to next queued song, if any.
-    Skipped entirely if the stop() that triggered this was an intentional
-    seek/speed-change/skip rather than the song actually ending."""
+    """Runs when a song ends on its own. Ignored when the stop came from our own
+    code (skip, stop, seek, speed), because that code already chose what plays next."""
     player = get_player(guild_id)
-
-    if player["suppress_advance"]:
-        player["suppress_advance"] = False
-        return
-
     async with player["lock"]:
-        # Clean up the finished song's file
-        old = player["current"]
-        if old and old.get("filename") and os.path.exists(old["filename"]):
-            try:
-                os.remove(old["filename"])
-            except:
-                pass
-
-        player["current"] = None
-        player["position"] = 0.0
-        player["started_at"] = None
-        player["speed"] = 1
-
-        if not player["queue"]:
+        if player["suppress_advance"]:
+            player["suppress_advance"] = False
             return
 
-        next_song = player["queue"].pop(0)
+        finished = player["current"]
+        player["current"] = None
+        player["started_at"] = None
+        player["position"] = 0.0
+        player["speed"] = 1
+        player["source"] = None
+        _delete_file(finished["filename"] if finished else None)
+
+        if not player["queue"]:
+            await _close_panel(player, "Queue finished.")
+            return
+
         guild = bot.get_guild(guild_id)
         vc = guild.voice_client if guild else None
         if not vc or not vc.is_connected():
             return
 
-        await _start_current(guild_id, vc, next_song, seek_seconds=0)
-
+        next_song = player["queue"].pop(0)
+        await _start_current(guild_id, vc, next_song)
         channel = next_song.get("text_channel")
         if channel:
-            try:
-                await _send_or_update_now_playing_panel(channel, guild_id)
-            except:
-                pass
+            await _send_or_update_now_playing_panel(channel, guild_id)
 
-async def _start_current(guild_id, vc, song, seek_seconds=0, is_reseek=False):
-    """Actually start FFmpeg playback for `song`. Caller must hold player['lock'].
-    This is the ONLY place vc.play() is called, preventing double-plays.
-    is_reseek=True means this is a seek/speed-change on the SAME song, so the
-    upcoming vc.stop() call is intentional and must not trigger auto-advance."""
+async def _start_current(guild_id, vc, song, seek_seconds=0, suppress_auto_advance=False):
+    """The only place vc.play() is called for music. Caller must hold player['lock'].
+    suppress_auto_advance=True tells _advance to ignore the stop this call triggers,
+    because the caller has already decided what plays next."""
     player = get_player(guild_id)
-
     if vc.is_playing() or vc.is_paused():
-        if is_reseek:
+        if suppress_auto_advance and player["current"] is not None:
             player["suppress_advance"] = True
         vc.stop()
 
-    source = _build_source(song["filename"], seek_seconds=seek_seconds, speed=player["speed"])
+    raw = _build_source(song["filename"], seek_seconds=seek_seconds, speed=player["speed"])
+    source = discord.PCMVolumeTransformer(raw, volume=player["volume"])
+    player["source"] = source
     player["current"] = song
     player["position"] = seek_seconds
     player["started_at"] = time.time()
-
     vc.play(source, after=lambda e: _play_finished(guild_id, e))
     last_activity[guild_id] = time.time()
 
-def _now_playing_text(player, guild_id):
-    song = player["current"]
-    if not song:
-        return "nothing is playing"
+async def _halt_playback(guild_id, vc):
+    """Stop audio and wipe the queue. Caller must hold player['lock']."""
+    player = get_player(guild_id)
+    if player["current"] is not None and (vc.is_playing() or vc.is_paused()):
+        player["suppress_advance"] = True
+        vc.stop()
+    if player["current"]:
+        _delete_file(player["current"]["filename"])
+    for song in player["queue"]:
+        _delete_file(song.get("filename"))
+    player["current"] = None
+    player["queue"] = []
+    player["position"] = 0.0
+    player["started_at"] = None
+    player["speed"] = 1
+    player["source"] = None
 
-    elapsed = current_elapsed(player)
-    duration = song.get("duration")
-    speed_tag = " (2x speed)" if player["speed"] == 2 else ""
-
-    lines = [
-        "Now Playing" + speed_tag,
-        song["title"],
-        f"Position: {format_duration(elapsed)} / {format_duration(duration)}",
-        f"Requested by: {song['requester']}",
-    ]
-
-    if player["queue"]:
-        lines.append(f"Up next: {player['queue'][0]['title']}")
-        lines.append(f"Songs in queue: {len(player['queue'])}")
-
-    return "\n".join(lines)
-
-SEEK_STEP = 10
+async def _close_panel(player, text):
+    """Replace the Now Playing embed with a plain status embed and forget it."""
+    message = player.get("now_playing_message")
+    player["now_playing_message"] = None
+    if message:
+        try:
+            await message.edit(embed=status_embed(text))
+        except discord.HTTPException:
+            pass
 
 def _progress_bar(elapsed, duration, length=20):
-    """Text progress bar: ────●──── """
+    """Block-character progress bar with partial fills for finer resolution."""
     if not duration or duration <= 0:
-        return "─" * length
+        return "▬" * length
     ratio = min(1.0, max(0.0, elapsed / duration))
-    pos = int(ratio * (length - 1))
-    return "─" * pos + "●" + "─" * (length - 1 - pos)
+    filled = ratio * length
+    full_blocks = int(filled)
+    remainder = filled - full_blocks
+
+    bar = "█" * full_blocks
+    partials = " ▏▎▍▌▋▊▉"
+    if full_blocks < length:
+        partial_index = int(remainder * (len(partials) - 1))
+        bar += partials[partial_index] if partial_index > 0 else "▬"
+        bar += "▬" * (length - full_blocks - 1)
+    return bar
+
+def _format_count(n):
+    if n is None:
+        return None
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
 
 def _build_now_playing_embed(player):
-    """Builds the button-controlled Now Playing embed with thumbnail on the left."""
+    """Now Playing embed: artwork top-right, clickable title, progress bar,
+    stats, up-next preview, and a volume readout in the footer."""
     song = player["current"]
     if not song:
         return None
 
     elapsed = current_elapsed(player)
     duration = song.get("duration")
-    speed_tag = " (2x speed)" if player["speed"] == 2 else ""
+    ratio = (elapsed / duration) if duration else 0
+    percent = int(min(100, max(0, ratio * 100)))
+
+    if player["speed"] == 2:
+        color = discord.Color.orange()
+    elif ratio > 0.85:
+        color = discord.Color.purple()
+    else:
+        color = discord.Color.from_rgb(30, 215, 96)
+
+    speed_tag = " (2x)" if player["speed"] == 2 else ""
+    title_line = f"[{song['title']}]({song['webpage_url']})" if song.get("webpage_url") else song["title"]
 
     embed = discord.Embed(
-        title="Now Playing" + speed_tag,
-        description=song["title"],
+        title=f"Now Playing{speed_tag}",
+        description=f"**{title_line}**",
+        color=color,
     )
 
     bar = _progress_bar(elapsed, duration)
     embed.add_field(
-        name=f"{format_duration(elapsed)} / {format_duration(duration)}",
-        value=bar,
+        name="\u200b",
+        value=f"`{format_duration(elapsed)}` {bar} `{format_duration(duration)}`  •  **{percent}%**",
         inline=False,
     )
 
-    if player["queue"]:
-        embed.add_field(name="Up next", value=player["queue"][0]["title"], inline=False)
+    stats = []
+    if song.get("uploader"):
+        stats.append(f"**Uploader**\n{song['uploader']}")
+    views = _format_count(song.get("view_count"))
+    if views:
+        stats.append(f"**Views**\n{views}")
+    likes = _format_count(song.get("like_count"))
+    if likes:
+        stats.append(f"**Likes**\n{likes}")
+    for stat in stats:
+        embed.add_field(name="\u200b", value=stat, inline=True)
 
-    embed.set_footer(text=f"Requested by: {song['requester']}")
-    
-    # Add thumbnail on the left side of the embed
-    thumbnail = song.get("thumbnail")
-    if thumbnail:
-        embed.set_thumbnail(url=thumbnail)
-    
+    if player["queue"]:
+        upcoming = player["queue"][0]
+        total_queue_duration = sum(s.get("duration") or 0 for s in player["queue"])
+        queue_line = (
+            f"**{upcoming['title']}**\n"
+            f"{len(player['queue'])} song(s) queued • {format_duration(total_queue_duration)} total"
+        )
+        embed.add_field(name="Up Next", value=queue_line, inline=False)
+
+    if song.get("thumbnail"):
+        embed.set_thumbnail(url=song["thumbnail"])
+
+    volume_pct = round(player["volume"] * 100)
+    embed.set_footer(
+        text=f"Requested by {song['requester']}  •  Volume {volume_pct}%",
+        icon_url=song.get("requester_avatar"),
+    )
     return embed
 
-class PlayerControls(discord.ui.View):
-    """Button controls for the Now Playing embed: rewind, forward, stop, skip.
-    Checks message ID to prevent stale embeds' buttons from affecting the current song."""
-
-    def __init__(self, guild_id):
-        super().__init__(timeout=None)
-        self.guild_id = guild_id
-
-    def _is_stale(self, interaction):
-        player = get_player(self.guild_id)
-        active_message = player.get("now_playing_message")
-        return active_message is None or active_message.id != interaction.message.id
-
-    async def _refresh(self, interaction):
-        """Refresh the embed on the message, keeping the same View/buttons."""
-        player = get_player(self.guild_id)
-        embed = _build_now_playing_embed(player)
-        try:
-            if embed is None:
-                await interaction.message.edit(content=None, embed=status_embed("Nothing is playing."), view=None)
-                player["now_playing_message"] = None
-            else:
-                # Always keep the view attached when editing
-                await interaction.message.edit(embed=embed, view=self)
-                # Ensure the message reference is current
-                player["now_playing_message"] = interaction.message
-        except Exception as e:
-            print(f"Refresh error: {e}", flush=True)
-
-    @discord.ui.button(label="Rewind 10s", style=discord.ButtonStyle.secondary, row=0)
-    async def rewind_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-        if self._is_stale(interaction):
-            return
-
-        vc = interaction.guild.voice_client
-        if not vc or not vc.is_connected():
-            return
-
-        player = get_player(self.guild_id)
-        async with player["lock"]:
-            if player["current"] is None:
-                return
-            new_pos = max(0, current_elapsed(player) - SEEK_STEP)
-            await _start_current(self.guild_id, vc, player["current"], seek_seconds=new_pos, is_reseek=True)
-            await self._refresh(interaction)
-
-    @discord.ui.button(label="Forward 10s", style=discord.ButtonStyle.secondary, row=0)
-    async def forward_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-        if self._is_stale(interaction):
-            return
-
-        vc = interaction.guild.voice_client
-        if not vc or not vc.is_connected():
-            return
-
-        player = get_player(self.guild_id)
-        async with player["lock"]:
-            if player["current"] is None:
-                return
-            new_pos = current_elapsed(player) + SEEK_STEP
-            duration = player["current"].get("duration")
-            if duration and new_pos >= duration:
-                new_pos = max(0, duration - 1)
-            await _start_current(self.guild_id, vc, player["current"], seek_seconds=new_pos, is_reseek=True)
-            await self._refresh(interaction)
-
-    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger, row=1)
-    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-        if self._is_stale(interaction):
-            return
-
-        vc = interaction.guild.voice_client
-        if not vc or not vc.is_connected():
-            return
-
-        player = get_player(self.guild_id)
-        async with player["lock"]:
-            if vc.is_playing() or vc.is_paused():
-                vc.stop()
-            await interaction.message.edit(content=None, embed=status_embed("Playback stopped."), view=None)
-            player["now_playing_message"] = None
-
-    @discord.ui.button(label="Skip", style=discord.ButtonStyle.primary, row=1)
-    async def skip_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-        if self._is_stale(interaction):
-            return
-
-        vc = interaction.guild.voice_client
-        if not vc or not vc.is_connected():
-            return
-
-        player = get_player(self.guild_id)
-        async with player["lock"]:
-            if player["current"] is None and not player["queue"]:
-                return
-
-            old = player["current"]
-
-            if not player["queue"]:
-                if vc.is_playing() or vc.is_paused():
-                    vc.stop()
-                else:
-                    if old and old.get("filename") and os.path.exists(old["filename"]):
-                        try:
-                            os.remove(old["filename"])
-                        except:
-                            pass
-                    player["current"] = None
-                    player["position"] = 0.0
-                    player["started_at"] = None
-                    player["speed"] = 1
-                await interaction.message.edit(content=None, embed=status_embed("Skipped. Queue is now empty."), view=None)
-                player["now_playing_message"] = None
-                return
-
-            next_song = player["queue"].pop(0)
-            await _start_current(self.guild_id, vc, next_song, seek_seconds=0)
-
-            if old and old.get("filename") and os.path.exists(old["filename"]):
-                try:
-                    os.remove(old["filename"])
-                except:
-                    pass
-
-            await self._refresh(interaction)
-
-async def _update_now_playing_embed(message, player, guild_id):
-    """Refresh the embed on an existing message, preserving the button view."""
-    try:
-        embed = _build_now_playing_embed(player)
-        if embed:
-            # Create a fresh View instance to re-attach buttons
-            view = PlayerControls(guild_id)
-            await message.edit(embed=embed, view=view)
-            # Keep the message reference current
-            player["now_playing_message"] = message
-    except Exception as e:
-        print(f"Failed to update embed for guild {guild_id}: {e}", flush=True)
+async def _update_now_playing_embed(message, player):
+    embed = _build_now_playing_embed(player)
+    if embed:
+        await message.edit(embed=embed)
 
 async def _send_or_update_now_playing_panel(channel, guild_id):
-    """Send a new Now Playing panel, or update the existing one if it's already posted.
-    Falls back to sending a new message if the old one was deleted/inaccessible."""
+    """Edit the active Now Playing message if there is one, otherwise post a new one."""
     player = get_player(guild_id)
     embed = _build_now_playing_embed(player)
     if embed is None:
         return None
 
-    existing_msg = player.get("now_playing_message")
-    view = PlayerControls(guild_id)
-
-    if existing_msg:
+    existing = player.get("now_playing_message")
+    if existing:
         try:
-            await existing_msg.edit(embed=embed, view=view)
-            return existing_msg
-        except (discord.NotFound, discord.HTTPException):
-            # Old message is gone; fall through to sending a new one
-            player["now_playing_message"] = None
-        except Exception as e:
-            print(f"Failed to edit Now Playing panel: {e}", flush=True)
+            await existing.edit(embed=embed)
+            return existing
+        except discord.HTTPException:
             player["now_playing_message"] = None
 
     try:
-        message = await channel.send(embed=embed, view=view)
+        message = await channel.send(embed=embed)
         player["now_playing_message"] = message
         return message
-    except Exception as e:
-        print(f"Failed to send Now Playing panel: {e}", flush=True)
+    except discord.HTTPException as e:
+        print("Failed to send Now Playing panel:", e, flush=True)
         return None
 
 def _download_song(search_query):
-    """Blocking download, run in executor. Returns (filename, title, duration, thumbnail_url)."""
+    """Blocking download, run in executor. Returns a metadata dict plus filename."""
     unique_id = f"{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
     outtmpl = f"song_{unique_id}.%(ext)s"
 
@@ -898,11 +806,17 @@ def _download_song(search_query):
         if "entries" in info:
             info = info["entries"][0]
         filename = ydl.prepare_filename(info)
-        title = info.get("title", "Unknown title")
-        duration = info.get("duration")
-        thumbnail = info.get("thumbnail")
 
-    return filename, title, duration, thumbnail
+    return {
+        "filename": filename,
+        "title": info.get("title", "Unknown title"),
+        "duration": info.get("duration"),
+        "thumbnail": info.get("thumbnail"),
+        "uploader": info.get("uploader") or info.get("channel"),
+        "view_count": info.get("view_count"),
+        "like_count": info.get("like_count"),
+        "webpage_url": info.get("webpage_url"),
+    }
 
 @bot.command()
 async def play(ctx, *, query):
@@ -930,17 +844,23 @@ async def play(ctx, *, query):
 
             loop = asyncio.get_event_loop()
             try:
-                filename, title, duration, thumbnail = await loop.run_in_executor(None, _download_song, search_query)
+                meta = await loop.run_in_executor(None, _download_song, search_query)
             except yt_dlp.utils.DownloadError:
                 return await loading_msg.edit(embed=status_embed(f"Couldn't find a song matching \"{query}\".", error=True))
 
             song = {
-                "filename": filename,
-                "title": title,
-                "duration": duration,
-                "thumbnail": thumbnail,
+                "filename": meta["filename"],
+                "title": meta["title"],
+                "duration": meta["duration"],
+                "thumbnail": meta["thumbnail"],
+                "uploader": meta["uploader"],
+                "view_count": meta["view_count"],
+                "like_count": meta["like_count"],
+                "webpage_url": meta["webpage_url"],
                 "requester": str(ctx.author.display_name),
+                "requester_avatar": ctx.author.display_avatar.url if ctx.author.display_avatar else None,
                 "text_channel": ctx.channel,
+                "added_at": time.time(),
             }
 
             # Check if we should play immediately or queue.
@@ -953,10 +873,32 @@ async def play(ctx, *, query):
                 # Something is playing or already queued: add to queue
                 player["queue"].append(song)
                 position = len(player["queue"])
-                embed = discord.Embed(title="Added to Queue", description=title)
-                embed.add_field(name="Duration", value=format_duration(duration), inline=True)
-                embed.add_field(name="Position in queue", value=str(position), inline=True)
-                embed.set_footer(text=f"Requested by: {ctx.author.display_name}")
+
+                # Estimate time until this song plays: remaining time on current song
+                # plus full duration of every song ahead of it in queue
+                eta = 0
+                if player["current"]:
+                    remaining = (player["current"].get("duration") or 0) - current_elapsed(player)
+                    eta += max(0, remaining)
+                for queued_song in player["queue"][:position - 1]:
+                    eta += queued_song.get("duration") or 0
+
+                embed = discord.Embed(
+                    title="Added to Queue",
+                    description=f"[{song['title']}]({song['webpage_url']})" if song.get("webpage_url") else song["title"],
+                    color=discord.Color.blurple(),
+                )
+                if song.get("thumbnail"):
+                    embed.set_thumbnail(url=song["thumbnail"])
+                embed.add_field(name="Duration", value=format_duration(song["duration"]), inline=True)
+                embed.add_field(name="Position", value=f"#{position}", inline=True)
+                embed.add_field(name="Est. time until played", value=format_duration(eta), inline=True)
+                if song.get("uploader"):
+                    embed.add_field(name="Uploader", value=song["uploader"], inline=True)
+                embed.set_footer(
+                    text=f"Requested by {ctx.author.display_name}",
+                    icon_url=song.get("requester_avatar"),
+                )
                 await loading_msg.edit(embed=embed)
 
     except Exception as e:
@@ -979,49 +921,21 @@ async def skip(ctx):
     try:
         vc = ctx.guild.voice_client
         if not vc or not vc.is_connected():
-            return await ctx.send(embed=status_embed("Not connected to a voice channel.", error=True))
-
+            return await ctx.send(embed=status_embed("I'm not in a voice channel.", error=True))
         player = get_player(ctx.guild.id)
-
         async with player["lock"]:
             if player["current"] is None and not player["queue"]:
                 return await ctx.send(embed=status_embed("Nothing to skip.", error=True))
-
             if not player["queue"]:
-                # No next song: stop cleanly, clear state, let _advance's cleanup run via stop's after=
-                if vc.is_playing() or vc.is_paused():
-                    vc.stop()
-                else:
-                    # Edge case: state says current but vc isn't playing; clear manually
-                    old = player["current"]
-                    if old and old.get("filename") and os.path.exists(old["filename"]):
-                        try:
-                            os.remove(old["filename"])
-                        except:
-                            pass
-                    player["current"] = None
-                    player["position"] = 0.0
-                    player["started_at"] = None
-                    player["speed"] = 1
-                await ctx.send(embed=status_embed("Skipped. Queue is now empty."))
-                return
+                await _halt_playback(ctx.guild.id, vc)
+                await _close_panel(player, "Skipped.")
+                return await ctx.send(embed=status_embed("Skipped. Queue is now empty."))
 
-            # There's a next song: pop it, stop current (triggers _advance via after=,
-            # but we do the transition directly here to reply with the new title now,
-            # and _advance will simply no-op since current becomes the next song's state)
+            finished = player["current"]
             next_song = player["queue"].pop(0)
-            old = player["current"]
-
-            await _start_current(ctx.guild.id, vc, next_song, seek_seconds=0)
-
-            if old and old.get("filename") and os.path.exists(old["filename"]):
-                try:
-                    os.remove(old["filename"])
-                except:
-                    pass
-
+            await _start_current(ctx.guild.id, vc, next_song, suppress_auto_advance=True)
+            _delete_file(finished["filename"] if finished else None)
             await _send_or_update_now_playing_panel(ctx.channel, ctx.guild.id)
-
     except Exception as e:
         print("Skip Error:", e, flush=True)
         await ctx.send(embed=status_embed("Something went wrong skipping.", error=True))
@@ -1046,7 +960,7 @@ async def forward(ctx):
             if duration and new_pos >= duration:
                 new_pos = max(0, duration - 1)
 
-            await _start_current(ctx.guild.id, vc, player["current"], seek_seconds=new_pos, is_reseek=True)
+            await _start_current(ctx.guild.id, vc, player["current"], seek_seconds=new_pos, suppress_auto_advance=True)
             await _send_or_update_now_playing_panel(ctx.channel, ctx.guild.id)
 
     except Exception as e:
@@ -1068,7 +982,7 @@ async def rewind(ctx):
 
             new_pos = max(0, current_elapsed(player) - SEEK_STEP)
 
-            await _start_current(ctx.guild.id, vc, player["current"], seek_seconds=new_pos, is_reseek=True)
+            await _start_current(ctx.guild.id, vc, player["current"], seek_seconds=new_pos, suppress_auto_advance=True)
             await _send_or_update_now_playing_panel(ctx.channel, ctx.guild.id)
 
     except Exception as e:
@@ -1093,7 +1007,7 @@ async def speed(ctx):
             current_pos = current_elapsed(player)
             player["speed"] = 2 if player["speed"] == 1 else 1
 
-            await _start_current(ctx.guild.id, vc, player["current"], seek_seconds=current_pos, is_reseek=True)
+            await _start_current(ctx.guild.id, vc, player["current"], seek_seconds=current_pos, suppress_auto_advance=True)
             await _send_or_update_now_playing_panel(ctx.channel, ctx.guild.id)
 
     except Exception as e:
@@ -1125,25 +1039,39 @@ async def queue(ctx):
         if player["current"] is None and not player["queue"]:
             return await ctx.send(embed=status_embed("Queue is empty.", error=True))
 
-        embed = discord.Embed(title="Queue")
-        
+        embed = discord.Embed(title="Queue", color=discord.Color.blurple())
+
         if player["current"]:
             song = player["current"]
             elapsed = current_elapsed(player)
             duration = song.get("duration")
-            bar = _progress_bar(elapsed, duration)
+            bar = _progress_bar(elapsed, duration, length=15)
             embed.add_field(
                 name="Now Playing",
-                value=f"{song['title']}\n{format_duration(elapsed)} / {format_duration(duration)}\n{bar}",
+                value=f"**{song['title']}**\n`{format_duration(elapsed)}` {bar} `{format_duration(duration)}`",
                 inline=False,
             )
-            embed.set_footer(text=f"Requested by: {song['requester']}")
-        
+            if song.get("thumbnail"):
+                embed.set_thumbnail(url=song["thumbnail"])
+            embed.set_footer(
+                text=f"Requested by {song['requester']}",
+                icon_url=song.get("requester_avatar"),
+            )
+
         if player["queue"]:
-            upcoming = ""
+            upcoming_lines = []
+            total_duration = 0
             for i, song in enumerate(player["queue"], start=1):
-                upcoming += f"{i}. {song['title']}\n"
-            embed.add_field(name="Upcoming", value=upcoming, inline=False)
+                dur = song.get("duration") or 0
+                total_duration += dur
+                upcoming_lines.append(f"`{i}.` **{song['title']}** — `{format_duration(dur)}` — *{song['requester']}*")
+
+            embed.add_field(
+                name=f"Up Next ({len(player['queue'])})",
+                value="\n".join(upcoming_lines),
+                inline=False,
+            )
+            embed.add_field(name="Total queue runtime", value=format_duration(total_duration), inline=True)
 
         await ctx.send(embed=embed)
     except Exception as e:
@@ -1185,32 +1113,27 @@ async def on_command_error(ctx, error):
 # ================= LIVE PROGRESS UPDATE LOOP =================
 
 async def _update_all_progress_bars():
-    """Background task: update all Now Playing embeds every 2 seconds so progress bar moves in real-time."""
+    """Refresh every active Now Playing embed on a fixed interval so the progress
+    bar moves. Four seconds is smooth enough and stays clear of Discord rate limits."""
     await bot.wait_until_ready()
     while True:
         try:
-            await asyncio.sleep(2)
+            await asyncio.sleep(4)
             for guild_id, player in list(players.items()):
-                if player["current"] is None:
+                message = player.get("now_playing_message")
+                if player["current"] is None or message is None:
                     continue
-                
-                msg = player.get("now_playing_message")
-                if msg is None:
-                    continue
-                
                 try:
-                    # Acquire the lock before reading player state and editing the message,
-                    # so button presses and progress updates don't race on the same message
                     async with player["lock"]:
-                        await _update_now_playing_embed(msg, player, guild_id)
+                        await _update_now_playing_embed(message, player)
+                except discord.NotFound:
+                    player["now_playing_message"] = None
                 except Exception as e:
-                    print(f"Failed to update progress for guild {guild_id}: {e}", flush=True)
+                    print(f"Progress update error for guild {guild_id}: {e}", flush=True)
         except asyncio.CancelledError:
             break
         except Exception as e:
-            print(f"Progress update loop error: {e}", flush=True)
-
-# ================= READY =================
+            print("Progress update loop error:", e, flush=True)
 
 @bot.event
 async def on_ready():
