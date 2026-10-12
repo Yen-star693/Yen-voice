@@ -1,4 +1,3 @@
-h
 import discord
 from discord.ext import commands
 import requests
@@ -560,7 +559,12 @@ def _build_source(filename, seek_seconds=0, speed=1):
     The file is already on disk, so seeking never re-downloads anything."""
     if not filename or not os.path.exists(filename):
         raise FileNotFoundError(f"Audio file not found: {filename}")
-    options = "-filter:a atempo=2.0" if speed == 2 else None
+    # Filter order matters: speed change first, then loudness is measured on the final audio.
+    filters = ["aresample=48000"]
+    if speed == 2:
+        filters.append("atempo=2.0")
+    filters.append("loudnorm=I=-16:TP=-1.5:LRA=11")
+    options = "-filter:a " + ",".join(filters)
     return discord.FFmpegPCMAudio(
         filename,
         executable=FFMPEG_PATH,
@@ -795,6 +799,7 @@ def _download_song(search_query):
 
     ydl_opts = {
         "format": "bestaudio/best",
+        "format_sort": ["abr", "asr"],
         "quiet": True,
         "noplaylist": True,
         "outtmpl": outtmpl,
